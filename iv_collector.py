@@ -5,6 +5,7 @@ from datetime import datetime
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionChainRequest
 print("debug new run")
+print("NEW VERSION")
 
 # ✅ API 키 (GitHub Secrets에서 가져옴)
 API_KEY = os.getenv("ALPACA_API_KEY")
