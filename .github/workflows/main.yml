@@ -1,6 +1,5 @@
 name: IV Collector
 on:
-  push:
   schedule:
     - cron: "0 21 * * *"
   workflow_dispatch:
@@ -31,4 +30,4 @@ jobs:
           git add iv_data.csv || true
           git add failed_symbols.txt || true
           git diff --staged --quiet || git commit -m "IV data $(date +'%Y-%m-%d')"
-          git push
+          git push --force
