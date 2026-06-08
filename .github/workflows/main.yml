@@ -24,4 +24,7 @@ jobs:
           pip install pandas requests alpaca-py
 
       - name: Python 실행
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python iv_collector.py
