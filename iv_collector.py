@@ -34,9 +34,9 @@ try:
 
         # ✅ IV 추출
         iv_list = [
-            opt.greeks.implied_volatility
+            opt.implied_volatility
             for opt in options
-            if opt.greeks and opt.greeks.iv
+            if hasattr(opt, "implied_volatility") and opt.implied_volatility
         ]
 
         if iv_list:
