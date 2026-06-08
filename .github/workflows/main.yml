@@ -1,11 +1,10 @@
 name: IV Collector
 
 on:
-  push:   # ✅ 이 줄 추가 (핵심)
+  push:
   schedule:
-    - cron: "0 21 * * *"   # 한국시간 오전 6시 실행
+    - cron: "0 21 * * *"
   workflow_dispatch:
-
 
 jobs:
   run-script:
@@ -22,7 +21,7 @@ jobs:
 
       - name: 라이브러리 설치
         run: |
-          pip install pandas requests
+          pip install pandas requests alpaca-py
 
-      - name: 실행
+      - name: Python 실행
         run: python iv_collector.py
