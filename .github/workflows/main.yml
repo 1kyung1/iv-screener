@@ -1,9 +1,11 @@
 name: IV Collector
 
 on:
+  push:   # ✅ 이 줄 추가 (핵심)
   schedule:
     - cron: "0 21 * * *"   # 한국시간 오전 6시 실행
   workflow_dispatch:
+
 
 jobs:
   run-script:
