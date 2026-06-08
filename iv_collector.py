@@ -36,7 +36,7 @@ try:
         iv_list = [
             opt.greeks.implied_volatility
             for opt in options
-            if opt.greeks and opt.greeks.implied_volatility
+            if opt.greeks and opt.greeks.iv
         ]
 
         if iv_list:
