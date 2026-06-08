@@ -1,30 +1,32 @@
 name: IV Collector
-
 on:
   push:
   schedule:
     - cron: "0 21 * * *"
   workflow_dispatch:
-
 jobs:
   run-script:
     runs-on: ubuntu-latest
-
     steps:
       - name: 코드 가져오기
         uses: actions/checkout@v3
-
       - name: Python 설치
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-
       - name: 라이브러리 설치
         run: |
-          pip install pandas requests alpaca-py
-
+          pip install pandas requests alpaca-py html5lib yfinance
       - name: Python 실행
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python iv_collector.py
+      - name: CSV 저장 & 푸시
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add iv_data.csv || true
+          git add failed_symbols.txt || true
+          git diff --staged --quiet || git commit -m "IV data $(date +'%Y-%m-%d')"
+          git push
