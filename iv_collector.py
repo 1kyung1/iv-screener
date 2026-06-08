@@ -1,4 +1,5 @@
 import os
+import requests
 import pandas as pd
 from datetime import datetime, date
 from alpaca.data.historical.option import OptionHistoricalDataClient
@@ -7,54 +8,89 @@ import time
 
 print("=== IV Data Collector START ===")
 
+# ====================================================
+# ✅ 주말/공휴일 체크 — 장 닫힌 날은 그냥 종료
+# ====================================================
+today_date = date.today()
+today = today_date.strftime("%Y-%m-%d")
+weekday = today_date.weekday()  # 0=월 ~ 6=일
+
+if weekday >= 5:  # 토(5), 일(6)
+    print(f"📅 오늘은 주말({['월','화','수','목','금','토','일'][weekday]})이라 스킵합니다.")
+    exit(0)
+
+# 미국 주요 공휴일 (고정일 기준, 매년 업데이트 필요)
+US_HOLIDAYS = [
+    "2026-01-01",  # 신정
+    "2026-01-19",  # MLK Day
+    "2026-02-16",  # Presidents Day
+    "2026-04-03",  # Good Friday
+    "2026-05-25",  # Memorial Day
+    "2026-07-03",  # Independence Day (관찰일)
+    "2026-09-07",  # Labor Day
+    "2026-11-26",  # Thanksgiving
+    "2026-11-27",  # Black Friday (반일)
+    "2026-12-25",  # 크리스마스
+]
+
+if today in US_HOLIDAYS:
+    print(f"🎉 오늘은 미국 공휴일이라 스킵합니다.")
+    exit(0)
+
+# ====================================================
+# ✅ 텔레그램 알림 함수
+# ====================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ 텔레그램 설정 없음, 알림 스킵")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=10)
+    except Exception as e:
+        print(f"⚠️ 텔레그램 전송 실패: {e}")
+
+# ====================================================
+# ✅ API 초기화
+# ====================================================
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 
-today = datetime.now().strftime("%Y-%m-%d")
-today_date = date.today()
-
 # ====================================================
-# ✅ S&P 500 리스트 — yfinance 방식 (lxml 불필요)
+# ✅ S&P 500 리스트
 # ====================================================
 def get_sp500_symbols():
     try:
-        import yfinance as yf
-        sp500 = pd.read_html(
+        resp = requests.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            flavor="html5lib"  # lxml 대신 html5lib 사용
-        )[0]
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        sp500 = pd.read_html(resp.text, flavor="html5lib")[0]
         symbols = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
         print(f"✅ S&P 500 종목 수: {len(symbols)}")
         return symbols
     except Exception as e:
-        print(f"⚠️ Wikipedia 로드 실패: {e}")
-        # ── fallback: requests + html5lib 직접 파싱 ──
-        try:
-            import requests
-            resp = requests.get(
-                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            sp500 = pd.read_html(resp.text, flavor="html5lib")[0]
-            symbols = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
-            print(f"✅ fallback 성공: {len(symbols)}개")
-            return symbols
-        except Exception as e2:
-            print(f"❌ 전체 실패, 기본 리스트 사용: {e2}")
-            return [
-                "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG",
-                "LLY","AVGO","JPM","TSLA","UNH","V","XOM","MA",
-                "JNJ","PG","HD","COST","WMT","NFLX","AMD","CRM",
-                "ABBV","CVX","MRK","KO","PEP","TMO","ACN",
-            ]
+        print(f"❌ S&P500 로드 실패: {e}")
+        return [
+            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG",
+            "LLY","AVGO","JPM","TSLA","UNH","V","XOM","MA",
+            "JNJ","PG","HD","COST","WMT","NFLX","AMD","CRM",
+            "ABBV","CVX","MRK","KO","PEP","TMO","ACN",
+        ]
 
 # ====================================================
-# ✅ 만기일 파싱 (Alpaca 심볼: AAPL240119C00150000)
+# ✅ 만기일 파싱
 # ====================================================
 def days_to_expiry(symbol: str) -> int:
     try:
-        # 뒤에서 15번째 ~ 9번째 자리: YYMMDD
         exp_str = symbol[-15:-9]
         exp_date = datetime.strptime(exp_str, "%y%m%d").date()
         return (exp_date - today_date).days
@@ -66,28 +102,19 @@ def days_to_expiry(symbol: str) -> int:
 # ====================================================
 def collect_iv(symbol: str) -> dict | None:
     try:
-        # BRK-B 같은 심볼은 Alpaca에서 점(.)으로 쓰는 경우가 있음
         alpaca_symbol = symbol.replace("-", ".")
-
         req = OptionChainRequest(underlying_symbol=alpaca_symbol)
         chain = client.get_option_chain(req)
         options = list(chain.values())
-
         if not options:
             return None
 
-        # ── 30~45일 만기 필터 ──────────────────────────
         filtered = [opt for opt in options if 30 <= days_to_expiry(opt.symbol) <= 45]
-
-        # fallback: 25~50일
         if not filtered:
             filtered = [opt for opt in options if 25 <= days_to_expiry(opt.symbol) <= 50]
-
         if not filtered:
-            print(f"  ⚠️ {symbol}: 30~45일 만기 없음")
             return None
 
-        # ── ATM 콜/풋 분리 ────────────────────────────
         call_ivs, put_ivs = [], []
         for opt in filtered:
             iv = getattr(opt, "implied_volatility", None)
@@ -96,13 +123,12 @@ def collect_iv(symbol: str) -> dict | None:
             delta = getattr(opt, "delta", None)
             if delta is not None and not (0.4 <= abs(float(delta)) <= 0.6):
                 continue
-            opt_type = opt.symbol[-9]  # C or P
+            opt_type = opt.symbol[-9]
             if opt_type == "C":
                 call_ivs.append(float(iv))
             elif opt_type == "P":
                 put_ivs.append(float(iv))
 
-        # ATM 없으면 전체 평균
         all_ivs = call_ivs + put_ivs
         if not all_ivs:
             all_ivs = [float(opt.implied_volatility)
@@ -118,7 +144,7 @@ def collect_iv(symbol: str) -> dict | None:
 
         return {
             "date": today,
-            "symbol": symbol,          # 원래 심볼 저장 (BRK-B)
+            "symbol": symbol,
             "dte_range": "30-45",
             "avg_iv": avg_iv,
             "atm_call_iv": avg_call,
@@ -126,17 +152,16 @@ def collect_iv(symbol: str) -> dict | None:
             "skew": skew,
             "sample_count": len(all_ivs),
         }
-
     except Exception as e:
         print(f"  ❌ {symbol} 에러: {e}")
         return None
-
 
 # ====================================================
 # ✅ 메인 루프
 # ====================================================
 symbols = get_sp500_symbols()
 results, failed = [], []
+start_time = time.time()
 
 for i, symbol in enumerate(symbols):
     print(f"[{i+1}/{len(symbols)}] {symbol} 수집 중...")
@@ -148,8 +173,10 @@ for i, symbol in enumerate(symbols):
         failed.append(symbol)
     time.sleep(0.3)
 
+elapsed = round(time.time() - start_time)
+
 # ====================================================
-# ✅ CSV 저장 (오늘 날짜 중복 방지)
+# ✅ CSV 저장
 # ====================================================
 file_path = "iv_data.csv"
 col_order = ["date", "symbol", "dte_range", "avg_iv",
@@ -165,12 +192,35 @@ if results:
     else:
         df_new.to_csv(file_path, index=False)
     print(f"✅ 저장 완료: {len(df_new)}개 종목")
-else:
-    print("❌ 수집된 데이터 없음")
 
 if failed:
-    print(f"\n⚠️ 실패 종목 ({len(failed)}개): {', '.join(failed)}")
     with open("failed_symbols.txt", "w") as f:
         f.write("\n".join(failed))
 
+# ====================================================
+# ✅ 텔레그램 알림 전송
+# ====================================================
+success_count = len(results)
+fail_count = len(failed)
+
+if success_count > 0:
+    msg = (
+        f"📊 <b>IV 데이터 수집 완료</b>\n"
+        f"📅 날짜: {today}\n"
+        f"✅ 성공: {success_count}개 종목\n"
+        f"❌ 실패: {fail_count}개 종목\n"
+        f"⏱ 소요시간: {elapsed//60}분 {elapsed%60}초\n"
+    )
+    if fail_count > 0:
+        msg += f"⚠️ 실패 종목: {', '.join(failed[:10])}"
+        if fail_count > 10:
+            msg += f" 외 {fail_count-10}개"
+else:
+    msg = (
+        f"❌ <b>IV 데이터 수집 실패</b>\n"
+        f"📅 날짜: {today}\n"
+        f"수집된 데이터가 없습니다."
+    )
+
+send_telegram(msg)
 print("=== IV Data Collector DONE ===")
