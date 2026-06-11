@@ -1,4 +1,5 @@
 import os
+import io
 import requests
 import pandas as pd
 import yfinance as yf
@@ -57,13 +58,12 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 client     = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 
 # ====================================================
-# ✅ S&P 500 리스트
-# ✅ 수집 불가 종목 제거 (yfinance 미지원 또는 옵션 없음)
+# ✅ S&P 500 리스트 (수집 불가 종목 제외)
 # ====================================================
 EXCLUDE_SYMBOLS = {
-    "BRK-B",   # yfinance 미지원
-    "BF-B",    # yfinance 미지원
-    "NVR",     # 옵션 데이터 없음
+    "BRK-B",  # yfinance 미지원
+    "BF-B",   # yfinance 미지원
+    "NVR",    # 옵션 데이터 없음
 }
 
 def get_sp500_symbols():
@@ -72,7 +72,6 @@ def get_sp500_symbols():
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
             headers={"User-Agent": "Mozilla/5.0"}
         )
-        import io
         sp500   = pd.read_html(io.StringIO(resp.text), flavor="html5lib")[0]
         symbols = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
         symbols = [s for s in symbols if s not in EXCLUDE_SYMBOLS]
@@ -95,7 +94,7 @@ def calc_hv(closes: pd.Series, period: int):
         return None
 
 # ====================================================
-# ✅ RSI 계산 (NaN 방지)
+# ✅ RSI 계산
 # ====================================================
 def calc_rsi(closes: pd.Series, period: int = 14):
     try:
@@ -105,6 +104,16 @@ def calc_rsi(closes: pd.Series, period: int = 14):
         rs    = gain / loss
         rsi   = (100 - (100 / (1 + rs))).iloc[-1]
         return round(float(rsi), 2) if not np.isnan(rsi) else None
+    except Exception:
+        return None
+
+# ====================================================
+# ✅ 수익률 계산 (NaN 안전)
+# ====================================================
+def safe_pct(s: pd.Series, n: int):
+    try:
+        v = s.dropna().pct_change(n, fill_method=None).iloc[-1]
+        return round(float(v) * 100, 2) if not np.isnan(v) else None
     except Exception:
         return None
 
@@ -121,64 +130,73 @@ def days_to_expiry(symbol: str) -> int:
 
 # ====================================================
 # ✅ yfinance로 OI/PCR/MaxPain 계산
+#    Alpaca 무료플랜 OI 미제공 → yfinance로 대체
 # ====================================================
-def calc_oi_metrics(ticker, target_dte_min=25, target_dte_max=50):
-    """
-    yfinance option_chain으로 OI/Volume/PCR/MaxPain 계산
-    Alpaca 무료플랜은 OI 미제공 → yfinance로 대체
-    """
+def calc_oi_metrics(ticker):
     try:
         exps = ticker.options
         if not exps:
             return None
 
-        # 30~45일 만기 찾기
+        # 30~45일 만기 우선, 없으면 25~50일
         target_exp = None
         for exp in exps:
             dte = (pd.Timestamp(exp).date() - today_date).days
-            if target_dte_min <= dte <= target_dte_max:
+            if 30 <= dte <= 45:
                 target_exp = exp
                 break
-
+        if not target_exp:
+            for exp in exps:
+                dte = (pd.Timestamp(exp).date() - today_date).days
+                if 25 <= dte <= 50:
+                    target_exp = exp
+                    break
         if not target_exp:
             return None
 
-        chain    = ticker.option_chain(target_exp)
-        calls    = chain.calls
-        puts     = chain.puts
+        chain = ticker.option_chain(target_exp)
+        calls = chain.calls
+        puts  = chain.puts
 
         call_oi  = int(calls["openInterest"].fillna(0).sum())
         put_oi   = int(puts["openInterest"].fillna(0).sum())
         call_vol = int(calls["volume"].fillna(0).sum())
         put_vol  = int(puts["volume"].fillna(0).sum())
 
+        # 디버그 로그
+        print(f"    [yf OI] call_oi={call_oi} put_oi={put_oi} "
+              f"call_vol={call_vol} put_vol={put_vol} exp={target_exp}")
+
         pcr_oi  = round(put_oi  / call_oi,  4) if call_oi  > 0 else None
         pcr_vol = round(put_vol / call_vol, 4) if call_vol > 0 else None
 
-        # Max Pain 계산
+        # Max Pain
         max_pain = None
         try:
             strikes = {}
             for _, row in calls.iterrows():
-                s = row["strike"]
-                oi = row["openInterest"] if not pd.isna(row["openInterest"]) else 0
+                s  = row["strike"]
+                oi = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
                 strikes.setdefault(s, {"call_oi": 0, "put_oi": 0})
                 strikes[s]["call_oi"] += oi
             for _, row in puts.iterrows():
-                s = row["strike"]
-                oi = row["openInterest"] if not pd.isna(row["openInterest"]) else 0
+                s  = row["strike"]
+                oi = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
                 strikes.setdefault(s, {"call_oi": 0, "put_oi": 0})
                 strikes[s]["put_oi"] += oi
 
             min_pain = float("inf")
             for test_price in sorted(strikes.keys()):
-                pain = 0
-                for s, d in strikes.items():
-                    if test_price > s: pain += (test_price - s) * d["call_oi"]
-                    if test_price < s: pain += (s - test_price) * d["put_oi"]
+                pain = sum(
+                    (test_price - s) * d["call_oi"] if test_price > s else 0
+                    for s, d in strikes.items()
+                ) + sum(
+                    (s - test_price) * d["put_oi"] if test_price < s else 0
+                    for s, d in strikes.items()
+                )
                 if pain < min_pain:
-                    min_pain  = pain
-                    max_pain  = test_price
+                    min_pain = pain
+                    max_pain = test_price
         except Exception:
             max_pain = None
 
@@ -191,39 +209,9 @@ def calc_oi_metrics(ticker, target_dte_min=25, target_dte_max=50):
             "pcr_vol":  pcr_vol,
             "max_pain": max_pain,
         }
-    except Exception:
+    except Exception as e:
+        print(f"    [yf OI 실패] {e}")
         return None
-
-# ====================================================
-# ✅ GEX 계산 (Alpaca 그릭스 + yfinance OI 조합)
-# ====================================================
-def calc_gex(options: list, spot_price: float):
-    try:
-        gex_total = gex_call = gex_put = 0.0
-        valid = 0
-        for opt in options:
-            greeks   = getattr(opt, "greeks", None)
-            oi_raw   = getattr(opt, "open_interest", None)
-            opt_type = opt.symbol[-9]
-            if greeks is None or oi_raw is None:
-                continue
-            gamma = getattr(greeks, "gamma", None)
-            if gamma is None:
-                continue
-            oi      = int(oi_raw)
-            gex_val = float(gamma) * oi * 100 * (spot_price ** 2) * 0.01
-            if opt_type == "C":
-                gex_call  += gex_val
-                gex_total += gex_val
-            elif opt_type == "P":
-                gex_put   += gex_val
-                gex_total -= gex_val
-            valid += 1
-        if valid == 0:
-            return None, None, None
-        return round(gex_total, 2), round(gex_call, 2), round(gex_put, 2)
-    except Exception:
-        return None, None, None
 
 # ====================================================
 # ✅ 단일 종목 전체 데이터 수집
@@ -241,60 +229,51 @@ def collect_data(symbol: str):
         days_to_earn = None
 
         if len(hist) > 60:
-            closes  = hist["Close"]
+            closes  = hist["Close"].dropna()
             volumes = hist["Volume"]
             high    = hist["High"]
             low     = hist["Low"]
 
-            # ✅ dropna()로 NaN 방지
-            closes_clean = closes.dropna()
-            if len(closes_clean) == 0:
+            if len(closes) == 0:
                 return None
 
-            cur_price = round(float(closes_clean.iloc[-1]), 4)
+            cur_price = round(float(closes.iloc[-1]), 4)
+            hv10 = calc_hv(closes, 10)
+            hv20 = calc_hv(closes, 20)
+            hv60 = calc_hv(closes, 60)
+            rsi  = calc_rsi(closes, 14)
 
-            hv10 = calc_hv(closes_clean, 10)
-            hv20 = calc_hv(closes_clean, 20)
-            hv60 = calc_hv(closes_clean, 60)
-            rsi  = calc_rsi(closes_clean, 14)
-
-            high52 = closes_clean.tail(252).max()
-            low52  = closes_clean.tail(252).min()
+            high52 = closes.tail(252).max()
+            low52  = closes.tail(252).min()
             if high52 != low52:
                 week52_pos = round((cur_price - low52) / (high52 - low52) * 100, 2)
 
             avg_vol   = volumes.tail(20).mean()
             vol_ratio = round(float(volumes.iloc[-1] / avg_vol), 2) if avg_vol > 0 else None
 
-            if len(closes_clean) >= 200:
-                ma20  = round(float(closes_clean.tail(20).mean()),  2)
-                ma50  = round(float(closes_clean.tail(50).mean()),  2)
-                ma200 = round(float(closes_clean.tail(200).mean()), 2)
+            if len(closes) >= 200:
+                ma20  = round(float(closes.tail(20).mean()),  2)
+                ma50  = round(float(closes.tail(50).mean()),  2)
+                ma200 = round(float(closes.tail(200).mean()), 2)
                 price_vs_ma200 = round((cur_price - ma200) / ma200 * 100, 2)
                 golden_cross   = int(ma50 > ma200)
 
-            # ✅ FutureWarning 수정 + NaN 체크
-            def safe_pct(s, n):
-                v = s.pct_change(n, fill_method=None).iloc[-1]
-                return round(float(v) * 100, 2) if not np.isnan(v) else None
-
-            ret_1d  = safe_pct(closes_clean, 1)
-            ret_5d  = safe_pct(closes_clean, 5)
-            ret_20d = safe_pct(closes_clean, 20)
+            ret_1d  = safe_pct(closes, 1)
+            ret_5d  = safe_pct(closes, 5)
+            ret_20d = safe_pct(closes, 20)
 
             tr    = pd.concat([
                 high - low,
-                (high - closes.shift()).abs(),
-                (low  - closes.shift()).abs()
+                (high - hist["Close"].shift()).abs(),
+                (low  - hist["Close"].shift()).abs()
             ], axis=1).max(axis=1)
-            atr_val = tr.rolling(14).mean().iloc[-1]
-            atr14   = round(float(atr_val), 4) if not np.isnan(atr_val) else None
+            atr_v = tr.rolling(14).mean().iloc[-1]
+            atr14 = round(float(atr_v), 4) if not np.isnan(atr_v) else None
 
-        # 베타
+        # ✅ 베타 - ticker.info로 변경 (fast_info보다 안정적)
         try:
-            info = ticker.fast_info
-            beta = getattr(info, "beta3_year", None) or getattr(info, "beta", None)
-            beta = round(float(beta), 3) if beta else None
+            beta_val = ticker.info.get("beta", None)
+            beta = round(float(beta_val), 3) if beta_val else None
         except Exception:
             beta = None
 
@@ -309,14 +288,14 @@ def collect_data(symbol: str):
             days_to_earn = None
 
         # ✅ yfinance OI/PCR/MaxPain
-        oi_metrics = calc_oi_metrics(ticker)
-        call_oi  = oi_metrics["call_oi"]  if oi_metrics else 0
-        put_oi   = oi_metrics["put_oi"]   if oi_metrics else 0
-        call_vol = oi_metrics["call_vol"] if oi_metrics else 0
-        put_vol  = oi_metrics["put_vol"]  if oi_metrics else 0
-        pcr_oi   = oi_metrics["pcr_oi"]   if oi_metrics else None
-        pcr_vol  = oi_metrics["pcr_vol"]  if oi_metrics else None
-        max_pain = oi_metrics["max_pain"] if oi_metrics else None
+        oi_m     = calc_oi_metrics(ticker)
+        call_oi  = oi_m["call_oi"]  if oi_m else 0
+        put_oi   = oi_m["put_oi"]   if oi_m else 0
+        call_vol = oi_m["call_vol"] if oi_m else 0
+        put_vol  = oi_m["put_vol"]  if oi_m else 0
+        pcr_oi   = oi_m["pcr_oi"]   if oi_m else None
+        pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
+        max_pain = oi_m["max_pain"] if oi_m else None
 
         # ── Alpaca 옵션 체인 (IV + 그릭스) ──────────────
         alpaca_symbol = symbol.replace("-", ".")
@@ -332,9 +311,9 @@ def collect_data(symbol: str):
         if not filtered:
             return None
 
-        # ── 그릭스 + IV 수집 ──────────────────────────
-        call_ivs = []
-        put_ivs  = []
+        # ── 그릭스 + IV 수집 ─────────────────────────────
+        call_ivs    = []
+        put_ivs     = []
         call_deltas = []
         put_deltas  = []
         gammas = []
@@ -394,7 +373,7 @@ def collect_data(symbol: str):
         avg_rho   = round(sum(rhos)  /len(rhos),   6) if rhos   else None
         avg_delta = None
         if call_deltas or put_deltas:
-            all_d = call_deltas + put_deltas
+            all_d     = call_deltas + put_deltas
             avg_delta = round(sum(all_d)/len(all_d), 4)
 
         # IV Term Structure
@@ -412,14 +391,10 @@ def collect_data(symbol: str):
         if bucket[60]: iv_60 = round(sum(bucket[60])/len(bucket[60]), 4)
         iv_term_slope = round(iv_60 - iv_30, 4) if (iv_30 and iv_60) else None
 
-        # Max Pain 대비 현재가
+        # Max Pain 대비 현재가 괴리
         pain_diff = None
         if max_pain and cur_price:
             pain_diff = round((cur_price - max_pain) / cur_price * 100, 2)
-
-        # GEX (Alpaca 그릭스 기반 - OI 있을 때만 계산됨)
-        spot = cur_price or 0.0
-        gex_total, gex_call, gex_put = calc_gex(options, spot) if spot > 0 else (None, None, None)
 
         return {
             "date":           today,
@@ -443,9 +418,6 @@ def collect_data(symbol: str):
             "avg_theta":      avg_theta,
             "avg_vega":       avg_vega,
             "avg_rho":        avg_rho,
-            "gex":            gex_total,
-            "gex_call":       gex_call,
-            "gex_put":        gex_put,
             "pcr_oi":         pcr_oi,
             "pcr_vol":        pcr_vol,
             "call_oi":        call_oi,
@@ -489,26 +461,19 @@ MARKET_TICKERS = {
     "GLD":  "gld",
 }
 
-def safe_pct_val(s, n):
-    try:
-        v = s.dropna().pct_change(n, fill_method=None).iloc[-1]
-        return round(float(v) * 100, 2) if not np.isnan(v) else None
-    except Exception:
-        return None
-
 def collect_market_data():
     try:
         row = {"date": today}
 
         for ticker_sym, col in MARKET_TICKERS.items():
             try:
-                hist = yf.Ticker(ticker_sym).history(period="60d")
+                hist   = yf.Ticker(ticker_sym).history(period="60d")
                 if hist.empty: continue
                 closes = hist["Close"].dropna()
                 if len(closes) == 0: continue
                 row[f"{col}_close"] = round(float(closes.iloc[-1]), 4)
-                row[f"{col}_ret1d"] = safe_pct_val(closes, 1)
-                row[f"{col}_ret5d"] = safe_pct_val(closes, 5)
+                row[f"{col}_ret1d"] = safe_pct(closes, 1)
+                row[f"{col}_ret5d"] = safe_pct(closes, 5)
             except Exception:
                 pass
 
@@ -526,24 +491,26 @@ def collect_market_data():
             ma50  = spy_hist.tail(50).mean()
             ma200 = spy_hist.tail(200).mean()
             row["spy_golden_cross"]   = int(ma50 > ma200)
-            row["spy_price_vs_ma200"] = round((spy_hist.iloc[-1] - ma200) / ma200 * 100, 2)
+            row["spy_price_vs_ma200"] = round(
+                (spy_hist.iloc[-1] - ma200) / ma200 * 100, 2
+            )
         except Exception:
             pass
 
         try:
             spy   = yf.Ticker("SPY")
             chain = spy.option_chain(spy.options[0])
-            row["spy_pcr_vol"] = round(
-                chain.puts["volume"].sum() / chain.calls["volume"].sum(), 4
-            )
+            c_vol = chain.calls["volume"].fillna(0).sum()
+            p_vol = chain.puts["volume"].fillna(0).sum()
+            row["spy_pcr_vol"] = round(p_vol / c_vol, 4) if c_vol > 0 else None
         except Exception:
             pass
 
         for etf, name in SECTOR_ETFS.items():
             try:
                 hist = yf.Ticker(etf).history(period="60d")["Close"].dropna()
-                row[f"sec_{name}_ret1d"] = safe_pct_val(hist, 1)
-                row[f"sec_{name}_ret5d"] = safe_pct_val(hist, 5)
+                row[f"sec_{name}_ret1d"] = safe_pct(hist, 1)
+                row[f"sec_{name}_ret5d"] = safe_pct(hist, 5)
             except Exception:
                 pass
 
@@ -561,7 +528,6 @@ IV_COL_ORDER = [
     "iv_30d", "iv_45d", "iv_60d", "iv_term_slope",
     "hv10", "hv20", "hv60",
     "avg_delta", "avg_gamma", "avg_theta", "avg_vega", "avg_rho",
-    "gex", "gex_call", "gex_put",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "max_pain", "pain_diff",
     "rsi14", "beta", "week52_pos", "vol_ratio",
@@ -602,8 +568,9 @@ for i, symbol in enumerate(symbols):
         results.append(row)
         print(
             f"  ✅ iv={row['avg_iv']} | hv20={row['hv20']} | "
-            f"skew={row['skew']} | pcr={row['pcr_oi']} | "
-            f"pain={row['max_pain']} | rsi={row['rsi14']}"
+            f"skew={row['skew']} | pcr_oi={row['pcr_oi']} | "
+            f"call_oi={row['call_oi']} | put_oi={row['put_oi']} | "
+            f"pain={row['max_pain']} | rsi={row['rsi14']} | beta={row['beta']}"
         )
     else:
         failed.append(symbol)
@@ -643,7 +610,7 @@ if success_count > 0:
         f"✅ 성공: {success_count}개 종목\n"
         f"❌ 실패: {fail_count}개 종목\n"
         f"⏱ 소요시간: {elapsed//60}분 {elapsed%60}초\n"
-        f"📈 수집항목: IV/HV/Skew/Greeks/PCR/MaxPain/RSI/MA/ATR/어닝"
+        f"📈 수집항목: IV/HV/Skew/Greeks/PCR/MaxPain/RSI/Beta/MA/ATR/어닝"
     )
     if fail_count > 0:
         msg += f"\n⚠️ 실패: {', '.join(failed[:10])}"
