@@ -155,7 +155,7 @@ def calc_gex(options: list, spot_price: float):
             oi_raw   = getattr(opt, "open_interest", None)
             opt_type = opt.symbol[-9]
 
-            # ✅ None과 0을 구분 (oi=0도 계산에 포함)
+            # ✅ None과 0 구분 (oi=0도 계산 포함)
             if greeks is None or oi_raw is None:
                 continue
 
@@ -238,10 +238,10 @@ def collect_data(symbol: str):
                 price_vs_ma200 = round((cur_price - ma200) / ma200 * 100, 2)
                 golden_cross   = int(ma50 > ma200)
 
-            # 수익률
-            ret_1d  = round(float(closes.pct_change(1).iloc[-1]  * 100), 2)
-            ret_5d  = round(float(closes.pct_change(5).iloc[-1]  * 100), 2)
-            ret_20d = round(float(closes.pct_change(20).iloc[-1] * 100), 2)
+            # ✅ FutureWarning 수정: fill_method=None 추가
+            ret_1d  = round(float(closes.pct_change(1,  fill_method=None).iloc[-1] * 100), 2)
+            ret_5d  = round(float(closes.pct_change(5,  fill_method=None).iloc[-1] * 100), 2)
+            ret_20d = round(float(closes.pct_change(20, fill_method=None).iloc[-1] * 100), 2)
 
             # ATR 14일
             tr    = pd.concat([
@@ -486,10 +486,10 @@ def collect_data(symbol: str):
 # ✅ 시장 전체 데이터 수집 (market_data)
 # ====================================================
 SECTOR_ETFS = {
-    "XLK": "tech",  "XLF": "fin",    "XLV": "health",
-    "XLE": "energy","XLI": "indus",  "XLY": "cons_disc",
-    "XLP": "cons_stap","XLU": "util","XLB": "material",
-    "XLRE":"realestate","XLC":"comm",
+    "XLK": "tech",      "XLF": "fin",       "XLV": "health",
+    "XLE": "energy",    "XLI": "indus",     "XLY": "cons_disc",
+    "XLP": "cons_stap", "XLU": "util",      "XLB": "material",
+    "XLRE":"realestate","XLC": "comm",
 }
 
 MARKET_TICKERS = {
@@ -511,8 +511,9 @@ def collect_market_data():
                     continue
                 closes = hist["Close"]
                 row[f"{col}_close"] = round(float(closes.iloc[-1]), 4)
-                row[f"{col}_ret1d"] = round(float(closes.pct_change(1).iloc[-1] * 100), 2)
-                row[f"{col}_ret5d"] = round(float(closes.pct_change(5).iloc[-1] * 100), 2)
+                # ✅ FutureWarning 수정
+                row[f"{col}_ret1d"] = round(float(closes.pct_change(1, fill_method=None).iloc[-1] * 100), 2)
+                row[f"{col}_ret5d"] = round(float(closes.pct_change(5, fill_method=None).iloc[-1] * 100), 2)
             except Exception:
                 pass
 
@@ -552,8 +553,9 @@ def collect_market_data():
         for etf, name in SECTOR_ETFS.items():
             try:
                 hist = yf.Ticker(etf).history(period="60d")["Close"]
-                row[f"sec_{name}_ret1d"] = round(float(hist.pct_change(1).iloc[-1] * 100), 2)
-                row[f"sec_{name}_ret5d"] = round(float(hist.pct_change(5).iloc[-1] * 100), 2)
+                # ✅ FutureWarning 수정
+                row[f"sec_{name}_ret1d"] = round(float(hist.pct_change(1, fill_method=None).iloc[-1] * 100), 2)
+                row[f"sec_{name}_ret5d"] = round(float(hist.pct_change(5, fill_method=None).iloc[-1] * 100), 2)
             except Exception:
                 pass
 
