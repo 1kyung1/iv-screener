@@ -22,7 +22,6 @@ def is_market_open(check_date: date) -> bool:
         nyse = xcals.get_calendar("XNYS")
         return nyse.is_session(check_date.strftime("%Y-%m-%d"))
     except Exception:
-        # 라이브러리 실패 시 주말만 체크
         return check_date.weekday() < 5
 
 if not is_market_open(today_date):
@@ -87,6 +86,20 @@ def calc_hv(closes: pd.Series, period: int):
         return None
 
 # ====================================================
+# ✅ RSI 계산 (NaN 방지)
+# ====================================================
+def calc_rsi(closes: pd.Series, period: int = 14):
+    try:
+        delta = closes.diff().dropna()
+        gain  = delta.clip(lower=0).rolling(period).mean()
+        loss  = (-delta.clip(upper=0)).rolling(period).mean()
+        rs    = gain / loss
+        rsi   = (100 - (100 / (1 + rs))).iloc[-1]
+        return round(float(rsi), 2) if not np.isnan(rsi) else None
+    except Exception:
+        return None
+
+# ====================================================
 # ✅ 만기일 파싱 → DTE 계산
 # ====================================================
 def days_to_expiry(symbol: str) -> int:
@@ -140,9 +153,6 @@ def calc_max_pain(options: list):
 
 # ====================================================
 # ✅ GEX 계산 (Gamma Exposure)
-#    콜 GEX: +gamma × OI × 100 × spot² × 0.01
-#    풋 GEX: -gamma × OI × 100 × spot² × 0.01
-#    전체 GEX 양수 → 변동성 억제 / 음수 → 변동성 증폭
 # ====================================================
 def calc_gex(options: list, spot_price: float):
     try:
@@ -156,7 +166,6 @@ def calc_gex(options: list, spot_price: float):
             oi_raw   = getattr(opt, "open_interest", None)
             opt_type = opt.symbol[-9]
 
-            # ✅ None과 0 구분 (oi=0도 계산 포함)
             if greeks is None or oi_raw is None:
                 continue
 
@@ -172,18 +181,14 @@ def calc_gex(options: list, spot_price: float):
                 gex_total += gex_val
             elif opt_type == "P":
                 gex_put   += gex_val
-                gex_total -= gex_val  # 풋은 음수
+                gex_total -= gex_val
 
             valid_count += 1
 
         if valid_count == 0:
             return None, None, None
 
-        return (
-            round(gex_total, 2),
-            round(gex_call,  2),
-            round(gex_put,   2),
-        )
+        return round(gex_total, 2), round(gex_call, 2), round(gex_put, 2)
     except Exception:
         return None, None, None
 
@@ -215,11 +220,8 @@ def collect_data(symbol: str):
             hv20 = calc_hv(closes, 20)
             hv60 = calc_hv(closes, 60)
 
-            # RSI 14일
-            delta_p = closes.diff()
-            gain    = delta_p.clip(lower=0).rolling(14).mean()
-            loss    = (-delta_p.clip(upper=0)).rolling(14).mean()
-            rsi     = round(float((100 - (100 / (1 + gain / loss))).iloc[-1]), 2)
+            # ✅ RSI - 별도 함수로 NaN 방지
+            rsi = calc_rsi(closes, 14)
 
             # 52주 위치 %
             high52 = closes.tail(252).max()
@@ -278,6 +280,14 @@ def collect_data(symbol: str):
         if not options:
             return None
 
+        # ✅ Alpaca OI 디버그 (첫 실행시 확인용 - 나중에 제거 가능)
+        sample = options[:2]
+        for o in sample:
+            print(f"  [OI] {o.symbol[-15:]} | "
+                  f"oi={getattr(o,'open_interest',None)} | "
+                  f"vol={getattr(o,'volume',None)} | "
+                  f"greeks={'있음' if getattr(o,'greeks',None) else '없음'}")
+
         # 30~45일 만기 필터
         filtered = [opt for opt in options if 30 <= days_to_expiry(opt.symbol) <= 45]
         if not filtered:
@@ -311,7 +321,6 @@ def collect_data(symbol: str):
             oi  = int(oi_raw)  if oi_raw  is not None else 0
             vol = int(vol_raw) if vol_raw is not None else 0
 
-            # OI / Volume 합산
             if opt_type == "C":
                 call_oi_total  += oi
                 call_vol_total += vol
@@ -319,7 +328,6 @@ def collect_data(symbol: str):
                 put_oi_total  += oi
                 put_vol_total += vol
 
-            # 그릭스 수집
             if greeks is not None:
                 delta = getattr(greeks, "delta", None)
                 gamma = getattr(greeks, "gamma", None)
@@ -332,7 +340,6 @@ def collect_data(symbol: str):
                 if vega  is not None: vegas.append(float(vega))
                 if rho   is not None: rhos.append(float(rho))
 
-                # ATM 필터: delta 0.4 ~ 0.6
                 if delta is not None and (0.4 <= abs(float(delta)) <= 0.6):
                     if iv:
                         if opt_type == "C":
@@ -342,7 +349,6 @@ def collect_data(symbol: str):
                             put_ivs.append(float(iv))
                             put_deltas.append(abs(float(delta)))
             else:
-                # 그릭스 없으면 IV만 수집
                 if iv:
                     if opt_type == "C":
                         call_ivs.append(float(iv))
@@ -365,7 +371,6 @@ def collect_data(symbol: str):
         skew       = round(avg_put - avg_call, 4) if (avg_call and avg_put) else None
         iv_hv_diff = round(avg_iv - hv20, 4)      if hv20                  else None
 
-        # 그릭스 평균
         avg_gamma = round(sum(gammas) / len(gammas), 6) if gammas else None
         avg_theta = round(sum(thetas) / len(thetas), 6) if thetas else None
         avg_vega  = round(sum(vegas)  / len(vegas),  6) if vegas  else None
@@ -390,7 +395,6 @@ def collect_data(symbol: str):
         if bucket[45]: iv_45 = round(sum(bucket[45]) / len(bucket[45]), 4)
         if bucket[60]: iv_60 = round(sum(bucket[60]) / len(bucket[60]), 4)
 
-        # Term Structure 기울기 (양수=정상 Contango, 음수=역전 Backwardation)
         iv_term_slope = round(iv_60 - iv_30, 4) if (iv_30 and iv_60) else None
 
         # ── Put/Call Ratio ────────────────────────────────
@@ -403,7 +407,7 @@ def collect_data(symbol: str):
         if max_pain and cur_price:
             pain_diff = round((cur_price - max_pain) / cur_price * 100, 2)
 
-        # ── GEX (전체 옵션 기준) ──────────────────────────
+        # ── GEX ──────────────────────────────────────────
         spot = cur_price or 0.0
         if spot > 0:
             gex_total, gex_call, gex_put = calc_gex(options, spot)
@@ -415,48 +419,32 @@ def collect_data(symbol: str):
             "symbol":         symbol,
             "dte_range":      "30-45",
             "cur_price":      cur_price,
-
-            # IV
             "avg_iv":         avg_iv,
             "atm_call_iv":    avg_call,
             "atm_put_iv":     avg_put,
             "skew":           skew,
             "iv_hv_diff":     iv_hv_diff,
-
-            # Term Structure
             "iv_30d":         iv_30,
             "iv_45d":         iv_45,
             "iv_60d":         iv_60,
             "iv_term_slope":  iv_term_slope,
-
-            # HV
             "hv10":           hv10,
             "hv20":           hv20,
             "hv60":           hv60,
-
-            # 그릭스 (ATM 평균)
             "avg_delta":      avg_delta,
             "avg_gamma":      avg_gamma,
             "avg_theta":      avg_theta,
             "avg_vega":       avg_vega,
             "avg_rho":        avg_rho,
-
-            # GEX
             "gex":            gex_total,
             "gex_call":       gex_call,
             "gex_put":        gex_put,
-
-            # Put/Call Ratio
             "pcr_oi":         pcr_oi,
             "pcr_vol":        pcr_vol,
             "call_oi":        call_oi_total,
             "put_oi":         put_oi_total,
-
-            # Max Pain
             "max_pain":       max_pain,
             "pain_diff":      pain_diff,
-
-            # 주가 지표
             "rsi14":          rsi,
             "beta":           beta,
             "week52_pos":     week52_pos,
@@ -465,17 +453,12 @@ def collect_data(symbol: str):
             "ret_5d":         ret_5d,
             "ret_20d":        ret_20d,
             "atr14":          atr14,
-
-            # 이동평균
             "ma20":           ma20,
             "ma50":           ma50,
             "ma200":          ma200,
             "price_vs_ma200": price_vs_ma200,
             "golden_cross":   golden_cross,
-
-            # 이벤트
             "days_to_earn":   days_to_earn,
-
             "sample_count":   len(all_ivs),
         }
 
@@ -484,7 +467,7 @@ def collect_data(symbol: str):
         return None
 
 # ====================================================
-# ✅ 시장 전체 데이터 수집 (market_data)
+# ✅ 시장 전체 데이터 수집
 # ====================================================
 SECTOR_ETFS = {
     "XLK": "tech",      "XLF": "fin",       "XLV": "health",
@@ -504,17 +487,21 @@ def collect_market_data():
     try:
         row = {"date": today}
 
-        # 시장 티커
         for ticker_sym, col in MARKET_TICKERS.items():
             try:
                 hist   = yf.Ticker(ticker_sym).history(period="60d")
                 if hist.empty:
                     continue
                 closes = hist["Close"]
-                row[f"{col}_close"] = round(float(closes.iloc[-1]), 4)
+                cur    = closes.iloc[-1]
+                if np.isnan(cur):
+                    continue
+                row[f"{col}_close"] = round(float(cur), 4)
                 # ✅ FutureWarning 수정
-                row[f"{col}_ret1d"] = round(float(closes.pct_change(1, fill_method=None).iloc[-1] * 100), 2)
-                row[f"{col}_ret5d"] = round(float(closes.pct_change(5, fill_method=None).iloc[-1] * 100), 2)
+                ret1d = closes.pct_change(1, fill_method=None).iloc[-1]
+                ret5d = closes.pct_change(5, fill_method=None).iloc[-1]
+                row[f"{col}_ret1d"] = round(float(ret1d) * 100, 2) if not np.isnan(ret1d) else None
+                row[f"{col}_ret5d"] = round(float(ret5d) * 100, 2) if not np.isnan(ret5d) else None
             except Exception:
                 pass
 
@@ -528,7 +515,7 @@ def collect_market_data():
             row["vix_above20"]       = int(v >= 20)
             row["vix_above30"]       = int(v >= 30)
 
-        # SPY 이평선 & 골든크로스
+        # SPY 이평선
         try:
             spy_hist = yf.Ticker("SPY").history(period="1y")["Close"]
             ma50     = spy_hist.tail(50).mean()
@@ -553,10 +540,11 @@ def collect_market_data():
         # 섹터 ETF
         for etf, name in SECTOR_ETFS.items():
             try:
-                hist = yf.Ticker(etf).history(period="60d")["Close"]
-                # ✅ FutureWarning 수정
-                row[f"sec_{name}_ret1d"] = round(float(hist.pct_change(1, fill_method=None).iloc[-1] * 100), 2)
-                row[f"sec_{name}_ret5d"] = round(float(hist.pct_change(5, fill_method=None).iloc[-1] * 100), 2)
+                hist  = yf.Ticker(etf).history(period="60d")["Close"]
+                ret1d = hist.pct_change(1, fill_method=None).iloc[-1]
+                ret5d = hist.pct_change(5, fill_method=None).iloc[-1]
+                row[f"sec_{name}_ret1d"] = round(float(ret1d) * 100, 2) if not np.isnan(ret1d) else None
+                row[f"sec_{name}_ret5d"] = round(float(ret5d) * 100, 2) if not np.isnan(ret5d) else None
             except Exception:
                 pass
 
@@ -566,7 +554,7 @@ def collect_market_data():
         return None
 
 # ====================================================
-# ✅ CSV 저장 (연도별 파일 분리 → GitHub 100MB 제한 대응)
+# ✅ CSV 저장 (연도별 파일 분리)
 # ====================================================
 IV_COL_ORDER = [
     "date", "symbol", "dte_range", "cur_price",
@@ -580,8 +568,7 @@ IV_COL_ORDER = [
     "rsi14", "beta", "week52_pos", "vol_ratio",
     "ret_1d", "ret_5d", "ret_20d", "atr14",
     "ma20", "ma50", "ma200", "price_vs_ma200", "golden_cross",
-    "days_to_earn",
-    "sample_count",
+    "days_to_earn", "sample_count",
 ]
 
 def save_csv(results: list, col_order: list, base_name: str):
@@ -629,7 +616,6 @@ for i, symbol in enumerate(symbols):
 
 elapsed = round(time.time() - start_time)
 
-# iv_data 저장
 if results:
     save_csv(results, IV_COL_ORDER, "iv_data")
 
@@ -637,7 +623,7 @@ if failed:
     with open("failed_symbols.txt", "w") as f:
         f.write("\n".join(failed))
 
-# market_data 저장
+# market_data 수집
 print("\n📡 시장 전체 데이터 수집 중...")
 market_row = collect_market_data()
 if market_row:
