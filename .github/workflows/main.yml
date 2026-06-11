@@ -39,11 +39,25 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
+
+          # ✅ 1. 새로 생성된 CSV 임시 보관 (git reset 전에)
+          cp iv_data_*.csv /tmp/     2>/dev/null || true
+          cp market_data_*.csv /tmp/ 2>/dev/null || true
+          cp failed_symbols.txt /tmp/ 2>/dev/null || true
+
+          # ✅ 2. 원격 최신 상태로 동기화
           git fetch origin main
           git reset --hard origin/main
-          git add iv_data_*.csv        || true
-          git add market_data_*.csv    || true
-          git add failed_symbols.txt   || true
-          git add iv_data.csv          || true
+
+          # ✅ 3. 임시 보관한 신규 데이터 복원
+          cp /tmp/iv_data_*.csv .     2>/dev/null || true
+          cp /tmp/market_data_*.csv . 2>/dev/null || true
+          cp /tmp/failed_symbols.txt . 2>/dev/null || true
+
+          # ✅ 4. 모든 CSV 커밋 & 푸시
+          git add iv_data_*.csv      || true
+          git add market_data_*.csv  || true
+          git add failed_symbols.txt || true
+          git add iv_data.csv        || true
           git diff --staged --quiet || git commit -m "IV data $(date +'%Y-%m-%d')"
           git push origin main
