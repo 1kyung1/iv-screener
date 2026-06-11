@@ -6,29 +6,30 @@ import numpy as np
 from datetime import datetime, date
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionChainRequest
+import exchange_calendars as xcals
 import time
 
 print("=== IV Data Collector START ===")
 
 # ====================================================
-# ✅ 주말/공휴일 체크
+# ✅ 주말/공휴일 체크 (NYSE 캘린더 자동)
 # ====================================================
 today_date = date.today()
 today      = today_date.strftime("%Y-%m-%d")
-weekday    = today_date.weekday()
 
-if weekday >= 5:
-    print("📅 오늘은 주말이라 스킵합니다.")
+def is_market_open(check_date: date) -> bool:
+    try:
+        nyse = xcals.get_calendar("XNYS")
+        return nyse.is_session(check_date.strftime("%Y-%m-%d"))
+    except Exception:
+        # 라이브러리 실패 시 주말만 체크
+        return check_date.weekday() < 5
+
+if not is_market_open(today_date):
+    print(f"📅 오늘({today})은 NYSE 휴장일입니다. 스킵합니다.")
     exit(0)
 
-US_HOLIDAYS = [
-    "2026-01-01","2026-01-19","2026-02-16","2026-04-03",
-    "2026-05-25","2026-07-03","2026-09-07","2026-11-26",
-    "2026-11-27","2026-12-25",
-]
-if today in US_HOLIDAYS:
-    print("🎉 오늘은 미국 공휴일이라 스킵합니다.")
-    exit(0)
+print(f"✅ 오늘({today}) 장 운영일 확인")
 
 # ====================================================
 # ✅ 텔레그램 알림
@@ -238,7 +239,7 @@ def collect_data(symbol: str):
                 price_vs_ma200 = round((cur_price - ma200) / ma200 * 100, 2)
                 golden_cross   = int(ma50 > ma200)
 
-            # ✅ FutureWarning 수정: fill_method=None 추가
+            # ✅ FutureWarning 수정: fill_method=None
             ret_1d  = round(float(closes.pct_change(1,  fill_method=None).iloc[-1] * 100), 2)
             ret_5d  = round(float(closes.pct_change(5,  fill_method=None).iloc[-1] * 100), 2)
             ret_20d = round(float(closes.pct_change(20, fill_method=None).iloc[-1] * 100), 2)
