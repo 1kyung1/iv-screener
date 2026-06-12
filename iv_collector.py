@@ -138,7 +138,6 @@ def calc_oi_metrics(ticker):
         if not exps:
             return None
 
-        # 30~45일 만기 우선, 없으면 25~50일
         target_exp = None
         for exp in exps:
             dte = (pd.Timestamp(exp).date() - today_date).days
@@ -269,14 +268,12 @@ def collect_data(symbol: str):
             atr_v = tr.rolling(14).mean().iloc[-1]
             atr14 = round(float(atr_v), 4) if not np.isnan(atr_v) else None
 
-        # ✅ 베타
         try:
             beta_val = ticker.info.get("beta", None)
             beta = round(float(beta_val), 3) if beta_val else None
         except Exception:
             beta = None
 
-        # 어닝까지 남은 일수
         try:
             cal = ticker.calendar
             if cal is not None and "Earnings Date" in cal:
@@ -286,7 +283,6 @@ def collect_data(symbol: str):
         except Exception:
             days_to_earn = None
 
-        # ✅ yfinance OI/PCR/MaxPain
         oi_m     = calc_oi_metrics(ticker)
         call_oi  = oi_m["call_oi"]  if oi_m else 0
         put_oi   = oi_m["put_oi"]   if oi_m else 0
@@ -296,7 +292,6 @@ def collect_data(symbol: str):
         pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
         max_pain = oi_m["max_pain"] if oi_m else None
 
-        # ── Alpaca 옵션 체인 (IV + 그릭스) ──────────────
         alpaca_symbol = symbol.replace("-", ".")
         req     = OptionChainRequest(underlying_symbol=alpaca_symbol)
         chain   = client.get_option_chain(req)
@@ -310,7 +305,6 @@ def collect_data(symbol: str):
         if not filtered:
             return None
 
-        # ── 그릭스 + IV 수집 ─────────────────────────────
         call_ivs    = []
         put_ivs     = []
         call_deltas = []
@@ -337,7 +331,7 @@ def collect_data(symbol: str):
                 if vega  is not None: vegas.append(float(vega))
                 if rho   is not None: rhos.append(float(rho))
 
-                # ✅ [수정] delta 필터 0.3~0.7로 확대 (기존 0.4~0.6 → 데이터 부족 원인)
+                # delta 필터 0.3~0.7로 확대 (기존 0.4~0.6)
                 if delta is not None and (0.3 <= abs(float(delta)) <= 0.7):
                     if iv:
                         if opt_type == "C":
@@ -364,8 +358,10 @@ def collect_data(symbol: str):
         avg_call = round(sum(call_ivs)/len(call_ivs), 4) if call_ivs else None
         avg_put  = round(sum(put_ivs) /len(put_ivs),  4) if put_ivs  else None
         avg_iv   = round(sum(all_ivs) /len(all_ivs),  4)
-        skew     = round(avg_put - avg_call, 4) if (avg_call and avg_put) else None
-        iv_hv_diff = round(avg_iv - hv20, 4) if hv20 else None
+
+        # ✅ 수집된 값으로 정확하게 계산 / 수집 안 되면 None 유지
+        skew       = round(avg_put - avg_call, 4) if (avg_call and avg_put) else None
+        iv_hv_diff = round(avg_iv - hv20, 4)      if hv20                   else None
 
         avg_gamma = round(sum(gammas)/len(gammas), 6) if gammas else None
         avg_theta = round(sum(thetas)/len(thetas), 6) if thetas else None
@@ -376,7 +372,7 @@ def collect_data(symbol: str):
             all_d     = call_deltas + put_deltas
             avg_delta = round(sum(all_d)/len(all_d), 4)
 
-        # ✅ [추가] GEX 계산 (gamma * OI * price^2 * 0.01)
+        # ✅ GEX: avg_gamma, cur_price 수집됐을 때만 계산, 아니면 None
         gex_call = None
         gex_put  = None
         gex      = None
@@ -385,30 +381,24 @@ def collect_data(symbol: str):
             gex_put  = round(avg_gamma * put_oi  * cur_price ** 2 * 0.01, 2)
             gex      = round(gex_call - gex_put, 2)
 
-        # IV Term Structure
-        # ✅ [수정] 버킷 범위 확대로 iv_60d 수집률 개선
+        # IV Term Structure: 버킷 범위 확대, 수집된 값만 사용
         iv_30 = iv_45 = iv_60 = None
         bucket = {30: [], 45: [], 60: []}
         for opt in options:
             dte = days_to_expiry(opt.symbol)
             iv  = getattr(opt, "implied_volatility", None)
             if not iv: continue
-            if 20 <= dte <= 37:   bucket[30].append(float(iv))  # 기존 25~35 → 20~37
-            elif 38 <= dte <= 52: bucket[45].append(float(iv))  # 기존 40~50 → 38~52
-            elif 53 <= dte <= 75: bucket[60].append(float(iv))  # 기존 55~65 → 53~75
+            if 20 <= dte <= 37:   bucket[30].append(float(iv))
+            elif 38 <= dte <= 52: bucket[45].append(float(iv))
+            elif 53 <= dte <= 75: bucket[60].append(float(iv))
         if bucket[30]: iv_30 = round(sum(bucket[30])/len(bucket[30]), 4)
         if bucket[45]: iv_45 = round(sum(bucket[45])/len(bucket[45]), 4)
         if bucket[60]: iv_60 = round(sum(bucket[60])/len(bucket[60]), 4)
 
-        # ✅ [수정] iv_term_slope: iv_60 없으면 iv_45 기반으로 추정
-        if iv_30 and iv_60:
-            iv_term_slope = round(iv_60 - iv_30, 4)
-        elif iv_30 and iv_45:
-            iv_term_slope = round((iv_45 - iv_30) / 15 * 30, 4)  # 30d 슬로프로 외삽
-        else:
-            iv_term_slope = None
+        # ✅ iv_term_slope: iv_30, iv_60 둘 다 수집됐을 때만 계산, 추정 없음
+        iv_term_slope = round(iv_60 - iv_30, 4) if (iv_30 and iv_60) else None
 
-        # Max Pain 대비 현재가 괴리
+        # ✅ pain_diff: max_pain, cur_price 둘 다 있을 때만 계산
         pain_diff = None
         if max_pain and cur_price:
             pain_diff = round((cur_price - max_pain) / cur_price * 100, 2)
@@ -435,9 +425,9 @@ def collect_data(symbol: str):
             "avg_theta":      avg_theta,
             "avg_vega":       avg_vega,
             "avg_rho":        avg_rho,
-            "gex":            gex,           # ✅ 추가
-            "gex_call":       gex_call,      # ✅ 추가
-            "gex_put":        gex_put,       # ✅ 추가
+            "gex":            gex,
+            "gex_call":       gex_call,
+            "gex_put":        gex_put,
             "pcr_oi":         pcr_oi,
             "pcr_vol":        pcr_vol,
             "call_oi":        call_oi,
@@ -548,7 +538,7 @@ IV_COL_ORDER = [
     "iv_30d", "iv_45d", "iv_60d", "iv_term_slope",
     "hv10", "hv20", "hv60",
     "avg_delta", "avg_gamma", "avg_theta", "avg_vega", "avg_rho",
-    "gex", "gex_call", "gex_put",   # ✅ 추가
+    "gex", "gex_call", "gex_put",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "max_pain", "pain_diff",
     "rsi14", "beta", "week52_pos", "vol_ratio",
@@ -592,7 +582,7 @@ for i, symbol in enumerate(symbols):
             f"skew={row['skew']} | pcr_oi={row['pcr_oi']} | "
             f"call_oi={row['call_oi']} | put_oi={row['put_oi']} | "
             f"pain={row['max_pain']} | rsi={row['rsi14']} | beta={row['beta']} | "
-            f"gex={row['gex']}"   # ✅ 추가
+            f"gex={row['gex']}"
         )
     else:
         failed.append(symbol)
