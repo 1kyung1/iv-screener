@@ -25,7 +25,8 @@ jobs:
 
       - name: 라이브러리 설치
         run: |
-          pip install pandas requests alpaca-py html5lib yfinance exchange_calendars
+          pip install --upgrade pip
+          pip install --upgrade pandas requests alpaca-py html5lib yfinance exchange_calendars
 
       - name: Python 실행
         env:
