@@ -225,6 +225,7 @@ def collect_data(symbol: str):
         ma20 = ma50 = ma200 = price_vs_ma200 = golden_cross = None
         ret_1d = ret_5d = ret_20d = atr14 = cur_price = None
         days_to_earn = None
+        open_price = high_price = low_price = volume = None
 
         if len(hist) > 60:
             closes  = hist["Close"].dropna()
@@ -235,7 +236,11 @@ def collect_data(symbol: str):
             if len(closes) == 0:
                 return None
 
-            cur_price = round(float(closes.iloc[-1]), 4)
+            cur_price  = round(float(closes.iloc[-1]),          4)
+            open_price = round(float(hist["Open"].iloc[-1]),     4)
+            high_price = round(float(hist["High"].iloc[-1]),     4)
+            low_price  = round(float(hist["Low"].iloc[-1]),      4)
+            volume     = int(hist["Volume"].iloc[-1])
             hv10 = calc_hv(closes, 10)
             hv20 = calc_hv(closes, 20)
             hv60 = calc_hv(closes, 60)
@@ -381,6 +386,13 @@ def collect_data(symbol: str):
             gex_put  = round(avg_gamma * put_oi  * cur_price ** 2 * 0.01, 2)
             gex      = round(gex_call - gex_put, 2)
 
+        # ✅ DEX: avg_delta, cur_price 수집됐을 때만 계산, 아니면 None
+        # DEX = avg_delta * (call_oi - put_oi) * cur_price * 100
+        # 양수 → 시장 순 롱 익스포저 / 음수 → 순 숏 익스포저
+        dex = None
+        if avg_delta is not None and cur_price is not None:
+            dex = round(avg_delta * (call_oi - put_oi) * cur_price * 100, 2)
+
         # IV Term Structure: 버킷 범위 확대, 수집된 값만 사용
         iv_30 = iv_45 = iv_60 = None
         bucket = {30: [], 45: [], 60: []}
@@ -407,6 +419,11 @@ def collect_data(symbol: str):
             "date":           today,
             "symbol":         symbol,
             "dte_range":      "30-45",
+            "open":           open_price,
+            "high":           high_price,
+            "low":            low_price,
+            "close":          cur_price,
+            "volume":         volume,
             "cur_price":      cur_price,
             "avg_iv":         avg_iv,
             "atm_call_iv":    avg_call,
@@ -428,6 +445,7 @@ def collect_data(symbol: str):
             "gex":            gex,
             "gex_call":       gex_call,
             "gex_put":        gex_put,
+            "dex":            dex,
             "pcr_oi":         pcr_oi,
             "pcr_vol":        pcr_vol,
             "call_oi":        call_oi,
@@ -533,12 +551,14 @@ def collect_market_data():
 # ✅ CSV 저장 (연도별 파일 분리)
 # ====================================================
 IV_COL_ORDER = [
-    "date", "symbol", "dte_range", "cur_price",
+    "date", "symbol", "dte_range",
+    "open", "high", "low", "close", "volume",
+    "cur_price",
     "avg_iv", "atm_call_iv", "atm_put_iv", "skew", "iv_hv_diff",
     "iv_30d", "iv_45d", "iv_60d", "iv_term_slope",
     "hv10", "hv20", "hv60",
     "avg_delta", "avg_gamma", "avg_theta", "avg_vega", "avg_rho",
-    "gex", "gex_call", "gex_put",
+    "gex", "gex_call", "gex_put", "dex",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "max_pain", "pain_diff",
     "rsi14", "beta", "week52_pos", "vol_ratio",
@@ -548,7 +568,9 @@ IV_COL_ORDER = [
 ]
 
 def save_csv(results: list, col_order: list, base_name: str):
-    file_path = f"{base_name}_{today_date.year}.csv"
+    # 6개월 단위 파일 분리: H1(1~6월), H2(7~12월)
+    half    = "H1" if today_date.month <= 6 else "H2"
+    file_path = f"{base_name}_{today_date.year}_{half}.csv"
     df_new    = pd.DataFrame(results)
     for col in col_order:
         if col not in df_new.columns:
@@ -582,7 +604,7 @@ for i, symbol in enumerate(symbols):
             f"skew={row['skew']} | pcr_oi={row['pcr_oi']} | "
             f"call_oi={row['call_oi']} | put_oi={row['put_oi']} | "
             f"pain={row['max_pain']} | rsi={row['rsi14']} | beta={row['beta']} | "
-            f"gex={row['gex']}"
+            f"gex={row['gex']} | dex={row['dex']}"
         )
     else:
         failed.append(symbol)
