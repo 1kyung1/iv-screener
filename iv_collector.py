@@ -226,6 +226,7 @@ def collect_data(symbol: str):
         ret_1d = ret_5d = ret_20d = atr14 = cur_price = None
         days_to_earn = None
         open_price = high_price = low_price = volume = None
+        vwap = vwap_diff = None
 
         if len(hist) > 60:
             closes  = hist["Close"].dropna()
@@ -241,6 +242,17 @@ def collect_data(symbol: str):
             high_price = round(float(hist["High"].iloc[-1]),     4)
             low_price  = round(float(hist["Low"].iloc[-1]),      4)
             volume     = int(hist["Volume"].iloc[-1])
+
+            # ✅ VWAP: 1분봉으로 당일 VWAP 계산 (장마감 후 실행 시 당일 완성값)
+            try:
+                intraday = yf.Ticker(yf_symbol).history(interval="1m", period="1d")
+                if not intraday.empty:
+                    typical   = (intraday["High"] + intraday["Low"] + intraday["Close"]) / 3
+                    vwap_val  = (typical * intraday["Volume"]).cumsum() / intraday["Volume"].cumsum()
+                    vwap      = round(float(vwap_val.iloc[-1]), 4)
+                    vwap_diff = round((cur_price - vwap) / vwap * 100, 2)  # 현재가 vs VWAP 괴리율(%)
+            except Exception:
+                pass
             hv10 = calc_hv(closes, 10)
             hv20 = calc_hv(closes, 20)
             hv60 = calc_hv(closes, 60)
@@ -424,6 +436,8 @@ def collect_data(symbol: str):
             "low":            low_price,
             "close":          cur_price,
             "volume":         volume,
+            "vwap":           vwap,
+            "vwap_diff":      vwap_diff,
             "cur_price":      cur_price,
             "avg_iv":         avg_iv,
             "atm_call_iv":    avg_call,
@@ -552,7 +566,7 @@ def collect_market_data():
 # ====================================================
 IV_COL_ORDER = [
     "date", "symbol", "dte_range",
-    "open", "high", "low", "close", "volume",
+    "open", "high", "low", "close", "volume", "vwap", "vwap_diff",
     "cur_price",
     "avg_iv", "atm_call_iv", "atm_put_iv", "skew", "iv_hv_diff",
     "iv_30d", "iv_45d", "iv_60d", "iv_term_slope",
