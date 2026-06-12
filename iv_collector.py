@@ -4,9 +4,11 @@ import requests
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionChainRequest
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import OptionChainRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 import exchange_calendars as xcals
 import time
 
@@ -53,18 +55,139 @@ def send_telegram(message: str):
 # ====================================================
 # ✅ API 초기화
 # ====================================================
-API_KEY    = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-client     = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
+API_KEY      = os.getenv("ALPACA_API_KEY")
+SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
+opt_client   = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
+stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 # ====================================================
-# ✅ S&P 500 리스트 (수집 불가 종목 제외)
+# ✅ 주가 데이터 수집 (yfinance 실패 시 Alpaca 폴백)
 # ====================================================
-EXCLUDE_SYMBOLS = {
-    "BRK-B",  # yfinance 미지원
-    "BF-B",   # yfinance 미지원
-    "NVR",    # 옵션 데이터 없음
-}
+def get_price_history(symbol: str, period_days: int = 365):
+    """
+    1차: yfinance
+    2차: Alpaca Stock API (yfinance 실패 시 자동 전환)
+    반환: pd.DataFrame with columns [Open, High, Low, Close, Volume]
+    """
+    yf_symbol = symbol.replace("-", ".")
+
+    # 1차: yfinance
+    try:
+        hist = yf.Ticker(yf_symbol).history(period=f"{period_days}d")
+        if not hist.empty and len(hist) > 10:
+            print(f"    [주가] {symbol} yfinance OK ({len(hist)}일)")
+            return hist, "yfinance"
+    except Exception as e:
+        print(f"    [주가] {symbol} yfinance 실패: {e}")
+
+    # 2차: Alpaca Stock API
+    try:
+        start_dt = datetime.now() - timedelta(days=period_days + 10)
+        req  = StockBarsRequest(
+            symbol_or_symbols=symbol.replace("-", "."),
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+        )
+        bars = stock_client.get_stock_bars(req).df
+        if bars.empty:
+            return None, None
+        # Alpaca 컬럼 → yfinance 컬럼명으로 맞추기
+        bars = bars.reset_index()
+        if "symbol" in bars.columns:
+            bars = bars.drop(columns=["symbol"])
+        bars = bars.rename(columns={
+            "open":   "Open",
+            "high":   "High",
+            "low":    "Low",
+            "close":  "Close",
+            "volume": "Volume",
+        })
+        bars = bars.set_index("timestamp")
+        bars.index = bars.index.tz_localize(None)
+        print(f"    [주가] {symbol} Alpaca 폴백 OK ({len(bars)}일)")
+        return bars, "alpaca"
+    except Exception as e:
+        print(f"    [주가] {symbol} Alpaca도 실패: {e}")
+        return None, None
+
+
+def get_intraday(symbol: str):
+    """
+    VWAP용 1분봉
+    1차: yfinance / 2차: Alpaca (1분봉)
+    """
+    yf_symbol = symbol.replace("-", ".")
+
+    # 1차: yfinance
+    try:
+        intraday = yf.Ticker(yf_symbol).history(interval="1m", period="1d")
+        if not intraday.empty:
+            return intraday
+    except Exception:
+        pass
+
+    # 2차: Alpaca 1분봉
+    try:
+        start_dt = datetime.now() - timedelta(days=1)
+        req  = StockBarsRequest(
+            symbol_or_symbols=symbol.replace("-", "."),
+            timeframe=TimeFrame.Minute,
+            start=start_dt,
+        )
+        bars = stock_client.get_stock_bars(req).df.reset_index()
+        if "symbol" in bars.columns:
+            bars = bars.drop(columns=["symbol"])
+        bars = bars.rename(columns={
+            "open": "Open", "high": "High",
+            "low":  "Low",  "close": "Close", "volume": "Volume",
+        })
+        bars = bars.set_index("timestamp")
+        bars.index = bars.index.tz_localize(None)
+        return bars
+    except Exception:
+        return None
+
+
+def get_ticker_info(symbol: str, field: str, default=None):
+    """
+    yfinance .info 필드 안전 조회
+    구조 바뀌어도 None 반환으로 안전 처리
+    """
+    try:
+        info = yf.Ticker(symbol.replace("-", ".")).info
+        return info.get(field, default)
+    except Exception:
+        return default
+
+
+def get_earnings_date(symbol: str):
+    """
+    어닝 날짜 조회 (yfinance 구조 변경 대비 다중 파싱)
+    """
+    try:
+        ticker = yf.Ticker(symbol.replace("-", "."))
+        # 방법 1: .calendar
+        cal = ticker.calendar
+        if cal is not None and "Earnings Date" in cal:
+            earn_date = cal["Earnings Date"]
+            if isinstance(earn_date, list) and earn_date:
+                return (pd.Timestamp(earn_date[0]).date() - today_date).days
+            if isinstance(earn_date, pd.Timestamp):
+                return (earn_date.date() - today_date).days
+        # 방법 2: .earnings_dates
+        ed = ticker.earnings_dates
+        if ed is not None and not ed.empty:
+            future = ed[ed.index.tz_localize(None) > pd.Timestamp.now()]
+            if not future.empty:
+                return (future.index[0].date() - today_date).days
+    except Exception:
+        pass
+    return None
+
+# ====================================================
+# ✅ S&P 500 리스트
+# ====================================================
+EXCLUDE_SYMBOLS = {"BRK-B", "BF-B", "NVR"}
 
 def get_sp500_symbols():
     try:
@@ -82,7 +205,7 @@ def get_sp500_symbols():
         return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "JPM", "TSLA", "UNH", "V"]
 
 # ====================================================
-# ✅ HV 계산
+# ✅ 보조 지표 계산 함수
 # ====================================================
 def calc_hv(closes: pd.Series, period: int):
     try:
@@ -93,9 +216,6 @@ def calc_hv(closes: pd.Series, period: int):
     except Exception:
         return None
 
-# ====================================================
-# ✅ RSI 계산
-# ====================================================
 def calc_rsi(closes: pd.Series, period: int = 14):
     try:
         delta = closes.diff().dropna()
@@ -107,9 +227,6 @@ def calc_rsi(closes: pd.Series, period: int = 14):
     except Exception:
         return None
 
-# ====================================================
-# ✅ 수익률 계산 (NaN 안전)
-# ====================================================
 def safe_pct(s: pd.Series, n: int):
     try:
         v = s.dropna().pct_change(n, fill_method=None).iloc[-1]
@@ -117,9 +234,6 @@ def safe_pct(s: pd.Series, n: int):
     except Exception:
         return None
 
-# ====================================================
-# ✅ 만기일 파싱 → DTE 계산
-# ====================================================
 def days_to_expiry(symbol: str) -> int:
     try:
         exp_str  = symbol[-15:-9]
@@ -129,12 +243,11 @@ def days_to_expiry(symbol: str) -> int:
         return -1
 
 # ====================================================
-# ✅ yfinance로 OI/PCR/MaxPain 계산
-#    Alpaca 무료플랜 OI 미제공 → yfinance로 대체
+# ✅ yfinance OI/PCR/MaxPain
 # ====================================================
-def calc_oi_metrics(ticker):
+def calc_oi_metrics(yf_ticker):
     try:
-        exps = ticker.options
+        exps = yf_ticker.options
         if not exps:
             return None
 
@@ -153,7 +266,7 @@ def calc_oi_metrics(ticker):
         if not target_exp:
             return None
 
-        chain    = ticker.option_chain(target_exp)
+        chain    = yf_ticker.option_chain(target_exp)
         calls    = chain.calls
         puts     = chain.puts
         call_oi  = int(calls["openInterest"].fillna(0).sum())
@@ -197,12 +310,9 @@ def calc_oi_metrics(ticker):
             max_pain = None
 
         return {
-            "call_oi":  call_oi,
-            "put_oi":   put_oi,
-            "call_vol": call_vol,
-            "put_vol":  put_vol,
-            "pcr_oi":   pcr_oi,
-            "pcr_vol":  pcr_vol,
+            "call_oi":  call_oi, "put_oi":   put_oi,
+            "call_vol": call_vol, "put_vol":  put_vol,
+            "pcr_oi":   pcr_oi,  "pcr_vol":  pcr_vol,
             "max_pain": max_pain,
         }
     except Exception as e:
@@ -214,9 +324,8 @@ def calc_oi_metrics(ticker):
 # ====================================================
 def collect_data(symbol: str):
     try:
-        yf_symbol = symbol.replace("-", ".")
-        ticker    = yf.Ticker(yf_symbol)
-        hist      = ticker.history(period="1y")
+        # ── 주가 데이터 (yfinance → Alpaca 자동 폴백) ──────────────
+        hist, price_source = get_price_history(symbol, period_days=365)
 
         hv10 = hv20 = hv60 = None
         rsi  = beta = week52_pos = vol_ratio = None
@@ -226,7 +335,7 @@ def collect_data(symbol: str):
         open_price = high_price = low_price = volume = None
         vwap = vwap_diff = None
 
-        if len(hist) > 60:
+        if hist is not None and len(hist) > 60:
             closes  = hist["Close"].dropna()
             volumes = hist["Volume"]
             high    = hist["High"]
@@ -241,10 +350,10 @@ def collect_data(symbol: str):
             low_price  = round(float(hist["Low"].iloc[-1]),  4)
             volume     = int(hist["Volume"].iloc[-1])
 
-            # VWAP: 1분봉으로 당일 VWAP 계산
+            # VWAP (yfinance → Alpaca 1분봉 폴백)
             try:
-                intraday = yf.Ticker(yf_symbol).history(interval="1m", period="1d")
-                if not intraday.empty:
+                intraday = get_intraday(symbol)
+                if intraday is not None and not intraday.empty:
                     typical  = (intraday["High"] + intraday["Low"] + intraday["Close"]) / 3
                     vwap_val = (typical * intraday["Volume"]).cumsum() / intraday["Volume"].cumsum()
                     vwap     = round(float(vwap_val.iloc[-1]), 4)
@@ -284,22 +393,16 @@ def collect_data(symbol: str):
             atr_v = tr.rolling(14).mean().iloc[-1]
             atr14 = round(float(atr_v), 4) if not np.isnan(atr_v) else None
 
-        try:
-            beta_val = ticker.info.get("beta", None)
-            beta = round(float(beta_val), 3) if beta_val else None
-        except Exception:
-            beta = None
+        # beta: yfinance .info (구조 변경 대비 안전 조회)
+        beta_val = get_ticker_info(symbol, "beta")
+        beta = round(float(beta_val), 3) if beta_val else None
 
-        try:
-            cal = ticker.calendar
-            if cal is not None and "Earnings Date" in cal:
-                earn_date = cal["Earnings Date"]
-                if isinstance(earn_date, list) and earn_date:
-                    days_to_earn = (pd.Timestamp(earn_date[0]).date() - today_date).days
-        except Exception:
-            days_to_earn = None
+        # 어닝 날짜 (다중 파싱 방식)
+        days_to_earn = get_earnings_date(symbol)
 
-        oi_m     = calc_oi_metrics(ticker)
+        # OI/PCR/MaxPain: yfinance 옵션 체인 (옵션은 대체 소스 없음)
+        yf_ticker = yf.Ticker(symbol.replace("-", "."))
+        oi_m     = calc_oi_metrics(yf_ticker)
         call_oi  = oi_m["call_oi"]  if oi_m else 0
         put_oi   = oi_m["put_oi"]   if oi_m else 0
         call_vol = oi_m["call_vol"] if oi_m else 0
@@ -308,9 +411,10 @@ def collect_data(symbol: str):
         pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
         max_pain = oi_m["max_pain"] if oi_m else None
 
+        # ── Alpaca 옵션 체인 (IV / Greeks) ────────────────────────
         alpaca_symbol = symbol.replace("-", ".")
         req     = OptionChainRequest(underlying_symbol=alpaca_symbol)
-        chain   = client.get_option_chain(req)
+        chain   = opt_client.get_option_chain(req)
         options = list(chain.values())
         if not options:
             return None
@@ -321,14 +425,9 @@ def collect_data(symbol: str):
         if not filtered:
             return None
 
-        call_ivs    = []
-        put_ivs     = []
-        call_deltas = []
-        put_deltas  = []
-        gammas = []
-        thetas = []
-        vegas  = []
-        rhos   = []
+        call_ivs = []; put_ivs = []
+        call_deltas = []; put_deltas = []
+        gammas = []; thetas = []; vegas = []; rhos = []
 
         for opt in filtered:
             iv       = getattr(opt, "implied_volatility", None)
@@ -347,7 +446,6 @@ def collect_data(symbol: str):
                 if vega  is not None: vegas.append(float(vega))
                 if rho   is not None: rhos.append(float(rho))
 
-                # delta 필터 0.3~0.7
                 if delta is not None and (0.3 <= abs(float(delta)) <= 0.7):
                     if iv:
                         if opt_type == "C":
@@ -363,11 +461,8 @@ def collect_data(symbol: str):
 
         all_ivs = call_ivs + put_ivs
         if not all_ivs:
-            all_ivs = [
-                float(opt.implied_volatility)
-                for opt in filtered
-                if getattr(opt, "implied_volatility", None)
-            ]
+            all_ivs = [float(opt.implied_volatility) for opt in filtered
+                       if getattr(opt, "implied_volatility", None)]
         if not all_ivs:
             return None
 
@@ -387,19 +482,16 @@ def collect_data(symbol: str):
             all_d     = call_deltas + put_deltas
             avg_delta = round(sum(all_d) / len(all_d), 4)
 
-        # GEX
         gex_call = gex_put = gex = None
         if avg_gamma is not None and cur_price is not None:
             gex_call = round(avg_gamma * call_oi * cur_price ** 2 * 0.01, 2)
             gex_put  = round(avg_gamma * put_oi  * cur_price ** 2 * 0.01, 2)
             gex      = round(gex_call - gex_put, 2)
 
-        # DEX: 양수 → 순 롱 익스포저 / 음수 → 순 숏 익스포저
         dex = None
         if avg_delta is not None and cur_price is not None:
             dex = round(avg_delta * (call_oi - put_oi) * cur_price * 100, 2)
 
-        # IV Term Structure
         iv_30 = iv_45 = iv_60 = None
         bucket = {30: [], 45: [], 60: []}
         for opt in options:
@@ -422,6 +514,7 @@ def collect_data(symbol: str):
         return {
             "date":           today,
             "symbol":         symbol,
+            "price_source":   price_source,   # 데이터 소스 추적용
             "dte_range":      "30-45",
             "open":           open_price,
             "high":           high_price,
@@ -489,23 +582,55 @@ SECTOR_ETFS = {
     "XLRE": "realestate", "XLC":  "comm",
 }
 MARKET_TICKERS = {
-    "^VIX":  "vix",   "^VIX9D": "vix9d", "^VIX3M": "vix3m",
-    "SPY":   "spy",   "QQQ":    "qqq",   "IWM":    "iwm",
-    "TLT":   "tlt",   "^TNX":   "tnx",   "UUP":    "uup",
-    "GLD":   "gld",
+    "^VIX": "vix", "^VIX9D": "vix9d", "^VIX3M": "vix3m",
+    "SPY":  "spy", "QQQ":    "qqq",   "IWM":    "iwm",
+    "TLT":  "tlt", "^TNX":   "tnx",   "UUP":    "uup",
+    "GLD":  "gld",
 }
+# Alpaca로 대체 가능한 것 (^VIX 계열은 Alpaca 미지원)
+ALPACA_FALLBACK_TICKERS = {"SPY", "QQQ", "IWM", "TLT", "UUP", "GLD"}
 
 def collect_market_data():
     try:
         row = {"date": today}
 
-        # 주요 시장 지수/ETF 종가 및 수익률
+        # 주요 시장 지수/ETF 종가 및 수익률 (yfinance → Alpaca 폴백)
         for ticker_sym, col in MARKET_TICKERS.items():
             try:
-                hist   = yf.Ticker(ticker_sym).history(period="60d")
-                if hist.empty: continue
+                hist = None
+                # 1차: yfinance
+                try:
+                    h = yf.Ticker(ticker_sym).history(period="60d")
+                    if not h.empty:
+                        hist = h
+                except Exception:
+                    pass
+
+                # 2차: Alpaca (VIX 계열 제외)
+                if hist is None and ticker_sym in ALPACA_FALLBACK_TICKERS:
+                    try:
+                        start_dt = datetime.now() - timedelta(days=70)
+                        req  = StockBarsRequest(
+                            symbol_or_symbols=ticker_sym,
+                            timeframe=TimeFrame.Day,
+                            start=start_dt,
+                        )
+                        bars = stock_client.get_stock_bars(req).df.reset_index()
+                        if "symbol" in bars.columns:
+                            bars = bars.drop(columns=["symbol"])
+                        bars = bars.rename(columns={"close": "Close"})
+                        bars = bars.set_index("timestamp")
+                        hist = bars
+                        print(f"    [{ticker_sym}] Alpaca 폴백 사용")
+                    except Exception:
+                        pass
+
+                if hist is None or hist.empty:
+                    continue
+
                 closes = hist["Close"].dropna()
-                if len(closes) == 0: continue
+                if len(closes) == 0:
+                    continue
                 row[f"{col}_close"] = round(float(closes.iloc[-1]), 4)
                 row[f"{col}_ret1d"] = safe_pct(closes, 1)
                 row[f"{col}_ret5d"] = safe_pct(closes, 5)
@@ -524,17 +649,19 @@ def collect_market_data():
 
         # SPY 골든크로스 / MA200 괴리율
         try:
-            spy_hist = yf.Ticker("SPY").history(period="1y")["Close"].dropna()
-            ma50  = spy_hist.tail(50).mean()
-            ma200 = spy_hist.tail(200).mean()
-            row["spy_golden_cross"]   = int(ma50 > ma200)
-            row["spy_price_vs_ma200"] = round(
-                (spy_hist.iloc[-1] - ma200) / ma200 * 100, 2
-            )
+            spy_hist, _ = get_price_history("SPY", period_days=365)
+            if spy_hist is not None:
+                spy_closes = spy_hist["Close"].dropna()
+                ma50  = spy_closes.tail(50).mean()
+                ma200 = spy_closes.tail(200).mean()
+                row["spy_golden_cross"]   = int(ma50 > ma200)
+                row["spy_price_vs_ma200"] = round(
+                    (spy_closes.iloc[-1] - ma200) / ma200 * 100, 2
+                )
         except Exception:
             pass
 
-        # SPY PCR (volume 기준)
+        # SPY PCR (volume 기준) — yfinance 옵션만 가능
         try:
             spy   = yf.Ticker("SPY")
             chain = spy.option_chain(spy.options[0])
@@ -544,8 +671,7 @@ def collect_market_data():
         except Exception:
             pass
 
-        # ✅ 주요 지수 GEX: SPY, QQQ, IWM
-        # Alpaca OI=None → yfinance OI + Alpaca gamma를 strike로 매칭해서 조합
+        # ✅ 주요 지수 GEX: Alpaca gamma + yfinance OI 조합
         for idx_sym, idx_col in [("SPY", "spy"), ("QQQ", "qqq"), ("IWM", "iwm")]:
             try:
                 idx_price = row.get(f"{idx_col}_close")
@@ -556,8 +682,8 @@ def collect_market_data():
                 put_gex_total  = 0.0
                 calculated     = False
 
-                # ── Step 1: yfinance에서 strike별 OI 맵 구성 ──────────────
-                yf_call_oi = {}  # {strike: oi}
+                # Step 1: yfinance에서 strike별 OI 맵 구성
+                yf_call_oi = {}
                 yf_put_oi  = {}
                 target_exp = None
                 try:
@@ -580,14 +706,14 @@ def collect_market_data():
                         for _, r in yf_chain.puts.iterrows():
                             yf_put_oi[round(float(r["strike"]), 1)] = float(r["openInterest"] or 0)
                         print(f"    [{idx_sym} yf OI] exp={target_exp} "
-                              f"call strikes={len(yf_call_oi)} put strikes={len(yf_put_oi)}")
+                              f"call={len(yf_call_oi)} put={len(yf_put_oi)} strikes")
                 except Exception as e:
                     print(f"    [{idx_sym} yf OI 실패] {e}")
 
-                # ── Step 2: Alpaca gamma + yfinance OI → GEX 계산 ──────────
+                # Step 2: Alpaca gamma + yfinance OI → GEX 계산
                 try:
                     req     = OptionChainRequest(underlying_symbol=idx_sym)
-                    chain   = client.get_option_chain(req)
+                    chain   = opt_client.get_option_chain(req)
                     options = list(chain.values())
 
                     filtered = [opt for opt in options if 30 <= days_to_expiry(opt.symbol) <= 45]
@@ -601,21 +727,15 @@ def collect_market_data():
                         gamma = getattr(greeks, "gamma", None)
                         if gamma is None: continue
 
-                        opt_type = opt.symbol[-9]   # C or P
-                        # strike: Alpaca 심볼 마지막 8자리 / 1000
+                        opt_type = opt.symbol[-9]
                         try:
                             strike = round(int(opt.symbol[-8:]) / 1000, 1)
                         except Exception:
                             continue
 
-                        if opt_type == "C":
-                            oi = yf_call_oi.get(strike, 0)
-                        elif opt_type == "P":
-                            oi = yf_put_oi.get(strike, 0)
-                        else:
-                            continue
-
+                        oi = yf_call_oi.get(strike, 0) if opt_type == "C" else yf_put_oi.get(strike, 0)
                         if oi <= 0: continue
+
                         gex_val = float(gamma) * oi * idx_price ** 2 * 0.01
                         if opt_type == "C":   call_gex_total += gex_val
                         elif opt_type == "P": put_gex_total  += gex_val
@@ -623,12 +743,11 @@ def collect_market_data():
 
                     if call_gex_total != 0.0 or put_gex_total != 0.0:
                         calculated = True
-                        print(f"    [{idx_sym} GEX hybrid] matched={matched} "
+                        print(f"    [{idx_sym} GEX] matched={matched} "
                               f"call={round(call_gex_total,2)} put={round(put_gex_total,2)} "
                               f"net={round(call_gex_total-put_gex_total,2)}")
                     else:
-                        print(f"    [{idx_sym} GEX hybrid] matched={matched} → GEX=0 "
-                              f"(strike 매칭 안됨 또는 OI 전부 0)")
+                        print(f"    [{idx_sym} GEX] matched={matched} → 계산값 없음")
                 except Exception as e:
                     print(f"    [{idx_sym} Alpaca gamma 실패] {e}")
 
@@ -640,12 +759,35 @@ def collect_market_data():
             except Exception as e:
                 print(f"    [{idx_sym} GEX 실패] {e}")
 
-        # 섹터 ETF 수익률
+        # 섹터 ETF 수익률 (yfinance → Alpaca 폴백)
         for etf, name in SECTOR_ETFS.items():
             try:
-                hist = yf.Ticker(etf).history(period="60d")["Close"].dropna()
-                row[f"sec_{name}_ret1d"] = safe_pct(hist, 1)
-                row[f"sec_{name}_ret5d"] = safe_pct(hist, 5)
+                hist = None
+                try:
+                    h = yf.Ticker(etf).history(period="60d")
+                    if not h.empty:
+                        hist = h
+                except Exception:
+                    pass
+                if hist is None:
+                    try:
+                        start_dt = datetime.now() - timedelta(days=70)
+                        req  = StockBarsRequest(
+                            symbol_or_symbols=etf,
+                            timeframe=TimeFrame.Day,
+                            start=start_dt,
+                        )
+                        bars = stock_client.get_stock_bars(req).df.reset_index()
+                        if "symbol" in bars.columns:
+                            bars = bars.drop(columns=["symbol"])
+                        bars = bars.rename(columns={"close": "Close"}).set_index("timestamp")
+                        hist = bars
+                    except Exception:
+                        pass
+                if hist is not None:
+                    closes = hist["Close"].dropna()
+                    row[f"sec_{name}_ret1d"] = safe_pct(closes, 1)
+                    row[f"sec_{name}_ret5d"] = safe_pct(closes, 5)
             except Exception:
                 pass
 
@@ -658,7 +800,7 @@ def collect_market_data():
 # ✅ CSV 저장 (6개월 단위 파일 분리)
 # ====================================================
 IV_COL_ORDER = [
-    "date", "symbol", "dte_range",
+    "date", "symbol", "price_source", "dte_range",
     "open", "high", "low", "close", "volume", "vwap", "vwap_diff",
     "cur_price",
     "avg_iv", "atm_call_iv", "atm_put_iv", "skew", "iv_hv_diff",
@@ -698,6 +840,7 @@ def save_csv(results: list, col_order: list, base_name: str):
 symbols    = get_sp500_symbols()
 results    = []
 failed     = []
+yf_fallback_count = 0   # Alpaca 폴백 사용 종목 수 추적
 start_time = time.time()
 
 for i, symbol in enumerate(symbols):
@@ -705,11 +848,13 @@ for i, symbol in enumerate(symbols):
     row = collect_data(symbol)
     if row:
         results.append(row)
+        if row.get("price_source") == "alpaca":
+            yf_fallback_count += 1
         print(
-            f"  ✅ iv={row['avg_iv']} | hv20={row['hv20']} | "
+            f"  ✅ [{row.get('price_source','?')}] "
+            f"iv={row['avg_iv']} | hv20={row['hv20']} | "
             f"skew={row['skew']} | pcr_oi={row['pcr_oi']} | "
-            f"call_oi={row['call_oi']} | put_oi={row['put_oi']} | "
-            f"pain={row['max_pain']} | rsi={row['rsi14']} | beta={row['beta']} | "
+            f"pain={row['max_pain']} | rsi={row['rsi14']} | "
             f"gex={row['gex']} | dex={row['dex']}"
         )
     else:
@@ -725,7 +870,6 @@ if failed:
     with open("failed_symbols.txt", "w") as f:
         f.write("\n".join(failed))
 
-# 시장 전체 데이터 수집
 print("\n📡 시장 전체 데이터 수집 중...")
 market_row = collect_market_data()
 if market_row:
@@ -753,6 +897,7 @@ if success_count > 0:
         f"📅 날짜: {today}\n"
         f"✅ 성공: {success_count}개 종목\n"
         f"❌ 실패: {fail_count}개 종목\n"
+        f"🔄 Alpaca 폴백: {yf_fallback_count}개 종목\n"
         f"⏱ 소요시간: {elapsed//60}분 {elapsed%60}초\n"
         f"📈 수집항목: IV/HV/Skew/Greeks/GEX/PCR/MaxPain/RSI/Beta/MA/ATR/어닝"
     )
