@@ -840,13 +840,130 @@ def save_csv(results: list, col_order: list, base_name: str):
     print(f"✅ 저장 완료: {file_path} ({len(df_new)}행)")
 
 # ====================================================
+# ✅ 데이터 소스 이상 감지 및 경보
+# ====================================================
+# 경보 기준 (전체 종목 대비 비율)
+ALERT_FALLBACK_RATE  = 0.30   # Alpaca 폴백이 30% 초과 → yfinance 주가 이상
+ALERT_FAIL_RATE      = 0.20   # 수집 실패가 20% 초과 → 전반적 오류
+ALERT_NULL_RATE      = 0.50   # 특정 컬럼 null이 50% 초과 → 해당 소스 이상
+
+def check_data_quality(results: list, yf_fallback_count: int, total: int) -> list:
+    """
+    수집 결과를 분석해서 이상 감지 시 경보 메시지 리스트 반환
+    """
+    alerts = []
+    if not results:
+        return alerts
+
+    df = pd.DataFrame(results)
+    n  = len(df)
+
+    # ── 1. yfinance 주가 이상 (Alpaca 폴백 비율) ─────────────────
+    fallback_rate = yf_fallback_count / total if total > 0 else 0
+    if fallback_rate >= ALERT_FALLBACK_RATE:
+        alerts.append(
+            f"⚠️ <b>yfinance 주가 이상 의심</b>\n"
+            f"   Alpaca 폴백 종목: {yf_fallback_count}/{total} "
+            f"({fallback_rate*100:.0f}%)\n"
+            f"   → yfinance 주가 API 구조 변경 가능성"
+        )
+
+    # ── 2. OI/PCR 대량 null (yfinance 옵션 체인 이상) ────────────
+    for col, label in [
+        ("pcr_oi",   "PCR(OI)"),
+        ("max_pain", "MaxPain"),
+        ("call_oi",  "Call OI"),
+    ]:
+        if col in df.columns:
+            null_rate = df[col].isna().sum() / n
+            if null_rate >= ALERT_NULL_RATE:
+                alerts.append(
+                    f"⚠️ <b>yfinance 옵션 OI 이상 의심</b>\n"
+                    f"   {label} null 비율: {null_rate*100:.0f}%\n"
+                    f"   → yfinance 옵션 체인 구조 변경 가능성\n"
+                    f"   → PCR/MaxPain/GEX 데이터 신뢰도 저하"
+                )
+                break  # OI 관련은 첫 번째 감지만 알림
+
+    # ── 3. IV 대량 null (Alpaca 옵션 체인 이상) ──────────────────
+    if "avg_iv" in df.columns:
+        null_rate = df["avg_iv"].isna().sum() / n
+        if null_rate >= ALERT_NULL_RATE:
+            alerts.append(
+                f"⚠️ <b>Alpaca 옵션 IV 이상 의심</b>\n"
+                f"   avg_iv null 비율: {null_rate*100:.0f}%\n"
+                f"   → Alpaca 옵션 체인 API 문제 가능성"
+            )
+
+    # ── 4. Greeks 대량 null (Alpaca Greeks 이상) ─────────────────
+    if "avg_gamma" in df.columns:
+        null_rate = df["avg_gamma"].isna().sum() / n
+        if null_rate >= ALERT_NULL_RATE:
+            alerts.append(
+                f"⚠️ <b>Alpaca Greeks 이상 의심</b>\n"
+                f"   avg_gamma null 비율: {null_rate*100:.0f}%\n"
+                f"   → Alpaca Greeks 제공 중단 가능성\n"
+                f"   → GEX/DEX 데이터 신뢰도 저하"
+            )
+
+    # ── 5. RSI/HV null (yfinance 주가 데이터 이상) ───────────────
+    if "rsi14" in df.columns:
+        null_rate = df["rsi14"].isna().sum() / n
+        if null_rate >= ALERT_NULL_RATE:
+            alerts.append(
+                f"⚠️ <b>주가 기반 지표 이상 의심</b>\n"
+                f"   RSI null 비율: {null_rate*100:.0f}%\n"
+                f"   → yfinance/Alpaca 주가 데이터 문제 가능성"
+            )
+
+    return alerts
+
+
+def check_market_data_quality(market_row: dict) -> list:
+    """
+    market_data 수집 결과 이상 감지
+    """
+    alerts = []
+    if not market_row:
+        return alerts
+
+    # VIX 없음 → yfinance 지수 수집 실패
+    if market_row.get("vix_close") is None:
+        alerts.append(
+            f"⚠️ <b>VIX 수집 실패</b>\n"
+            f"   → yfinance 지수(^VIX) 수집 불가\n"
+            f"   → 시장 공포지수 데이터 공백"
+        )
+
+    # SPY GEX 없음
+    if market_row.get("spy_gex") is None:
+        alerts.append(
+            f"⚠️ <b>SPY/QQQ GEX 수집 실패</b>\n"
+            f"   → yfinance OI 또는 Alpaca Greeks 문제\n"
+            f"   → 시장 GEX 데이터 공백"
+        )
+
+    # 섹터 ETF 절반 이상 null
+    sec_cols  = [k for k in market_row if k.startswith("sec_") and k.endswith("_ret1d")]
+    sec_nulls = sum(1 for k in sec_cols if market_row.get(k) is None)
+    if sec_cols and sec_nulls / len(sec_cols) >= 0.5:
+        alerts.append(
+            f"⚠️ <b>섹터 ETF 수집 이상</b>\n"
+            f"   null 섹터: {sec_nulls}/{len(sec_cols)}\n"
+            f"   → yfinance/Alpaca ETF 데이터 문제 가능성"
+        )
+
+    return alerts
+
+
+# ====================================================
 # ✅ 메인 루프
 # ====================================================
-symbols    = get_sp500_symbols()
-results    = []
-failed     = []
-yf_fallback_count = 0   # Alpaca 폴백 사용 종목 수 추적
-start_time = time.time()
+symbols           = get_sp500_symbols()
+results           = []
+failed            = []
+yf_fallback_count = 0
+start_time        = time.time()
 
 for i, symbol in enumerate(symbols):
     print(f"[{i+1}/{len(symbols)}] {symbol} 수집 중...")
@@ -891,10 +1008,38 @@ if market_row:
     )
 
 # ====================================================
-# ✅ 텔레그램 알림
+# ✅ 데이터 품질 이상 감지 → 텔레그램 즉시 경보
+# ====================================================
+total_symbols = len(symbols)
+fail_count    = len(failed)
+fail_rate     = fail_count / total_symbols if total_symbols > 0 else 0
+
+# 수집 실패율 경보
+if fail_rate >= ALERT_FAIL_RATE:
+    send_telegram(
+        f"🚨 <b>수집 실패율 경보</b>\n"
+        f"📅 날짜: {today}\n"
+        f"❌ 실패: {fail_count}/{total_symbols} ({fail_rate*100:.0f}%)\n"
+        f"→ API 전반적 문제 또는 네트워크 오류 의심"
+    )
+
+# 종목별 데이터 품질 경보
+data_alerts = check_data_quality(results, yf_fallback_count, total_symbols)
+for alert in data_alerts:
+    send_telegram(f"📅 {today}\n{alert}")
+    print(f"  🚨 경보 발송: {alert[:50]}...")
+
+# 시장 데이터 품질 경보
+market_alerts = check_market_data_quality(market_row or {})
+for alert in market_alerts:
+    send_telegram(f"📅 {today}\n{alert}")
+    print(f"  🚨 경보 발송: {alert[:50]}...")
+
+# ====================================================
+# ✅ 최종 완료 텔레그램 알림
 # ====================================================
 success_count = len(results)
-fail_count    = len(failed)
+alert_count   = len(data_alerts) + len(market_alerts) + (1 if fail_rate >= ALERT_FAIL_RATE else 0)
 
 if success_count > 0:
     msg = (
@@ -906,8 +1051,10 @@ if success_count > 0:
         f"⏱ 소요시간: {elapsed//60}분 {elapsed%60}초\n"
         f"📈 수집항목: IV/HV/Skew/Greeks/GEX/PCR/MaxPain/RSI/Beta/MA/ATR/어닝"
     )
+    if alert_count > 0:
+        msg += f"\n🚨 데이터 이상 경보: {alert_count}건 (위 메시지 확인)"
     if fail_count > 0:
-        msg += f"\n⚠️ 실패: {', '.join(failed[:10])}"
+        msg += f"\n⚠️ 실패 종목: {', '.join(failed[:10])}"
         if fail_count > 10:
             msg += f" 외 {fail_count-10}개"
 else:
