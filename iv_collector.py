@@ -17,8 +17,6 @@ print("=== IV Data Collector START ===")
 
 # ====================================================
 # ✅ 날짜 기준: UTC → ET(뉴욕) 변환 후 직전 거래일 사용
-#    UTC 23:00 실행 시 ET 기준으로는 당일 19:00 (아직 금요일)
-#    → date.today()를 UTC로 쓰면 토요일로 잡혀서 exit(0) 버그 발생
 # ====================================================
 ET_TZ  = pytz.timezone("America/New_York")
 now_et = datetime.now(pytz.utc).astimezone(ET_TZ)
@@ -31,7 +29,7 @@ def is_market_open(check_date: date) -> bool:
         return check_date.weekday() < 5
 
 # ====================================================
-# ✅ 텔레그램 알림 (날짜 체크보다 먼저 정의 — 휴장일 안내에도 사용)
+# ✅ 텔레그램 알림
 # ====================================================
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -52,7 +50,7 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"⚠️ 텔레그램 전송 실패: {e}")
 
-# 장마감(ET 16:00) 전이면 아직 당일 데이터가 없으므로 하루 전 기준
+# 장마감(ET 16:00) 전이면 하루 전 기준
 et_date = now_et.date()
 if now_et.hour < 16:
     et_date -= timedelta(days=1)
@@ -63,7 +61,7 @@ today      = today_date.strftime("%Y-%m-%d")
 print(f"🕐 ET 현재시각: {now_et.strftime('%Y-%m-%d %H:%M')} | 수집 기준일: {today}")
 
 if not is_market_open(today_date):
-    if today_date.weekday() >= 5:  # 토(5)/일(6)
+    if today_date.weekday() >= 5:
         print(f"📅 {today}은 주말(NYSE 휴장)입니다. 스킵합니다.")
         send_telegram(
             f"📅 <b>{today}</b>\n"
@@ -94,11 +92,6 @@ stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 # ✅ 주가 데이터 수집 (yfinance 실패 시 Alpaca 폴백)
 # ====================================================
 def get_price_history(symbol: str, period_days: int = 365):
-    """
-    1차: yfinance
-    2차: Alpaca Stock API (yfinance 실패 시 자동 전환)
-    반환: pd.DataFrame with columns [Open, High, Low, Close, Volume]
-    """
     yf_symbol = symbol.replace("-", ".")
 
     # 1차: yfinance
@@ -141,10 +134,6 @@ def get_price_history(symbol: str, period_days: int = 365):
 
 
 def get_intraday(symbol: str):
-    """
-    VWAP용 1분봉
-    1차: yfinance / 2차: Alpaca (1분봉)
-    """
     yf_symbol = symbol.replace("-", ".")
 
     # 1차: yfinance
@@ -178,7 +167,6 @@ def get_intraday(symbol: str):
 
 
 def get_ticker_info(symbol: str, field: str, default=None):
-    """yfinance .info 필드 안전 조회"""
     try:
         info = yf.Ticker(symbol.replace("-", ".")).info
         return info.get(field, default)
@@ -187,10 +175,8 @@ def get_ticker_info(symbol: str, field: str, default=None):
 
 
 def get_earnings_date(symbol: str):
-    """어닝 날짜 조회 (yfinance 구조 변경 대비 다중 파싱)"""
     try:
         ticker = yf.Ticker(symbol.replace("-", "."))
-        # 방법 1: .calendar
         cal = ticker.calendar
         if cal is not None and "Earnings Date" in cal:
             earn_date = cal["Earnings Date"]
@@ -198,7 +184,6 @@ def get_earnings_date(symbol: str):
                 return (pd.Timestamp(earn_date[0]).date() - today_date).days
             if isinstance(earn_date, pd.Timestamp):
                 return (earn_date.date() - today_date).days
-        # 방법 2: .earnings_dates
         ed = ticker.earnings_dates
         if ed is not None and not ed.empty:
             future = ed[ed.index.tz_localize(None) > pd.Timestamp.now()]
@@ -425,8 +410,8 @@ def collect_data(symbol: str):
         oi_m     = calc_oi_metrics(yf_ticker)
         call_oi  = oi_m["call_oi"]  if oi_m else 0
         put_oi   = oi_m["put_oi"]   if oi_m else 0
-        call_vol = oi_m["call_vol"] if oi_m else 0
-        put_vol  = oi_m["put_vol"]  if oi_m else 0
+        call_vol = oi_m["call_vol"] if oi_m else 0  # ✅ 변수 보존
+        put_vol  = oi_m["put_vol"]  if oi_m else 0  # ✅ 변수 보존
         pcr_oi   = oi_m["pcr_oi"]   if oi_m else None
         pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
         max_pain = oi_m["max_pain"] if oi_m else None
@@ -444,21 +429,17 @@ def collect_data(symbol: str):
                     "_fail_detail": str(e)}
 
         if not options:
-            # DTE 분포 확인용: 전체 옵션 없음
             return {"_fail_reason": "ALPACA_EMPTY", "_fail_detail": "옵션체인 응답이 비어있음"}
 
-        # DTE 분포 로깅 (만기일 공백 감지)
         all_dtes = sorted(set(days_to_expiry(opt.symbol) for opt in options))
         print(f"    [DTE분포] {symbol}: {all_dtes[:10]}{'...' if len(all_dtes)>10 else ''}")
 
-        # ── DTE 필터: 이상적 범위 → 확장 범위 → 가장 가까운 미래 만기 자동 선택 ──
         dte_range_used = "30-45"
         filtered = [opt for opt in options if 30 <= days_to_expiry(opt.symbol) <= 45]
         if not filtered:
             dte_range_used = "25-50"
             filtered = [opt for opt in options if 25 <= days_to_expiry(opt.symbol) <= 50]
         if not filtered:
-            # 만기 직후 공백: 미래 만기 중 가장 가까운 만기 그룹으로 자동 선택
             valid = [opt for opt in options if days_to_expiry(opt.symbol) > 0]
             if not valid:
                 return {"_fail_reason": "ALPACA_EMPTY",
@@ -593,6 +574,8 @@ def collect_data(symbol: str):
             "pcr_vol":        pcr_vol,
             "call_oi":        call_oi,
             "put_oi":         put_oi,
+            "call_vol":       call_vol,   # ✅ 추가 (콜 급등 감지에 필요)
+            "put_vol":        put_vol,    # ✅ 추가
             "max_pain":       max_pain,
             "pain_diff":      pain_diff,
             "rsi14":          rsi,
@@ -723,7 +706,6 @@ def collect_market_data():
                 put_gex_total  = 0.0
                 calculated     = False
 
-                # ── yfinance OI 수집 (만기 범위를 넓게: 7~60일) ──
                 yf_call_oi = {}
                 yf_put_oi  = {}
                 try:
@@ -735,7 +717,6 @@ def collect_market_data():
                         if 7 <= dte <= 60:
                             valid_exps.append(exp)
 
-                    # 범위 내 만기가 없으면 가장 가까운 3개 사용
                     if not valid_exps and all_exps:
                         valid_exps = all_exps[:3]
 
@@ -763,13 +744,11 @@ def collect_market_data():
 
                 yf_oi_available = bool(yf_call_oi or yf_put_oi)
 
-                # ── Alpaca gamma + OI 매칭으로 GEX 계산 ──
                 try:
                     req     = OptionChainRequest(underlying_symbol=idx_sym)
                     chain   = opt_client.get_option_chain(req)
                     options = list(chain.values())
 
-                    # 만기 필터: 30~45일 우선, 없으면 7~60일로 확대
                     filtered = [opt for opt in options if 30 <= days_to_expiry(opt.symbol) <= 45]
                     if not filtered:
                         filtered = [opt for opt in options if 7 <= days_to_expiry(opt.symbol) <= 60]
@@ -870,7 +849,7 @@ def collect_market_data():
         return None
 
 # ====================================================
-# ✅ CSV 저장 (6개월 단위 파일 분리)
+# ✅ CSV 컬럼 순서 (call_vol, put_vol 추가)
 # ====================================================
 IV_COL_ORDER = [
     "date", "symbol", "price_source", "dte_range",
@@ -882,6 +861,7 @@ IV_COL_ORDER = [
     "avg_delta", "avg_gamma", "avg_theta", "avg_vega", "avg_rho",
     "gex", "gex_call", "gex_put", "dex",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
+    "call_vol", "put_vol",   # ✅ 추가
     "max_pain", "pain_diff",
     "rsi14", "beta", "week52_pos", "vol_ratio",
     "ret_1d", "ret_5d", "ret_20d", "atr14",
@@ -1010,6 +990,41 @@ def check_market_data_quality(market_row: dict) -> list:
 
 
 # ====================================================
+# ✅ 콜 거래량 급등 감지
+# ====================================================
+def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol: int = 500) -> list:
+    """
+    call_vol / call_oi >= threshold 이고 call_vol >= min_call_vol 인 종목 탐지.
+    비율 높은 순으로 정렬하여 반환.
+    """
+    surges = []
+    for row in results:
+        call_vol = row.get("call_vol") or 0
+        call_oi  = row.get("call_oi")  or 0
+        pcr_vol  = row.get("pcr_vol")
+
+        if call_vol < min_call_vol:
+            continue
+        if call_oi <= 0:
+            continue
+
+        ratio = call_vol / call_oi
+        if ratio < vol_oi_threshold:
+            continue
+
+        surges.append({
+            "symbol":   row["symbol"],
+            "call_vol": int(call_vol),
+            "call_oi":  int(call_oi),
+            "ratio":    round(ratio, 2),
+            "pcr_vol":  pcr_vol,
+        })
+
+    surges.sort(key=lambda x: x["ratio"], reverse=True)
+    return surges
+
+
+# ====================================================
 # ✅ 메인 루프
 # ====================================================
 symbols           = get_sp500_symbols()
@@ -1018,9 +1033,6 @@ failed            = []
 yf_fallback_count = 0
 start_time        = time.time()
 
-# ====================================================
-# ✅ 실패 원인 추적용
-# ====================================================
 FAIL_REASON = {
     "ALPACA_EMPTY":    "Alpaca 옵션체인 비어있음",
     "ALPACA_DTE":      "DTE 범위(25~50일) 옵션 없음 (만기일 공백)",
@@ -1029,14 +1041,13 @@ FAIL_REASON = {
     "PRICE_FAIL":      "주가 데이터 수집 실패",
     "UNKNOWN":         "알 수 없는 에러",
 }
-failed_details = []   # {"symbol": str, "reason": str, "detail": str}
-alpaca_consecutive_fails = 0   # 연속 실패 카운터 (Rate Limit 감지용)
+failed_details = []
+alpaca_consecutive_fails = 0
 
 for i, symbol in enumerate(symbols):
     print(f"[{i+1}/{len(symbols)}] {symbol} 수집 중...")
     row = collect_data(symbol)
 
-    # 실패 판정
     if row is None or "_fail_reason" in (row or {}):
         reason  = (row or {}).get("_fail_reason", "UNKNOWN")
         detail  = (row or {}).get("_fail_detail", "")
@@ -1046,7 +1057,6 @@ for i, symbol in enumerate(symbols):
         failed.append(symbol)
         failed_details.append({"symbol": symbol, "reason": reason, "detail": detail})
 
-        # Rate Limit 연속 감지: 5개 연속이면 경보 + 슬립
         if reason == "ALPACA_RATELIMIT":
             alpaca_consecutive_fails += 1
             if alpaca_consecutive_fails >= 5:
@@ -1074,7 +1084,8 @@ for i, symbol in enumerate(symbols):
         f"iv={row['avg_iv']} | hv20={row['hv20']} | "
         f"skew={row['skew']} | pcr_oi={row['pcr_oi']} | "
         f"pain={row['max_pain']} | rsi={row['rsi14']} | "
-        f"gex={row['gex']} | dex={row['dex']}"
+        f"gex={row['gex']} | dex={row['dex']} | "
+        f"call_vol={row['call_vol']} | put_vol={row['put_vol']}"  # ✅ 로그 추가
     )
     time.sleep(0.3)
 
@@ -1084,7 +1095,7 @@ elapsed = round(time.time() - start_time)
 # ✅ 실패 원인 분류 요약
 # ====================================================
 if failed_details:
-    from collections import Counter
+    from collections import Counter, defaultdict
     reason_counter = Counter(d["reason"] for d in failed_details)
 
     print("\n" + "="*55)
@@ -1094,8 +1105,6 @@ if failed_details:
         label = FAIL_REASON.get(reason, reason)
         print(f"  {label}: {count}개")
 
-    # 원인별 상위 5개 종목 출력
-    from collections import defaultdict
     by_reason = defaultdict(list)
     for d in failed_details:
         by_reason[d["reason"]].append(d)
@@ -1107,7 +1116,6 @@ if failed_details:
             print(f"    • {d['symbol']}: {d['detail']}")
     print("="*55 + "\n")
 
-    # 만기일 공백이 전체 실패의 50% 이상이면 텔레그램 별도 경보
     dte_fail_count = reason_counter.get("ALPACA_DTE", 0)
     if dte_fail_count >= len(failed_details) * 0.5:
         dte_samples = [d["detail"] for d in by_reason["ALPACA_DTE"][:3]]
@@ -1132,7 +1140,6 @@ if results:
 if failed:
     with open("failed_symbols.txt", "w") as f:
         f.write("\n".join(failed))
-    # 실패 원인 상세 CSV 저장
     if failed_details:
         pd.DataFrame(failed_details).to_csv("failed_details.csv", index=False, encoding="utf-8-sig")
         print(f"📄 실패 상세 저장: failed_details.csv ({len(failed_details)}건)")
@@ -1199,7 +1206,6 @@ if success_count > 0:
         msg += f"\n⚠️ 실패 종목: {', '.join(failed[:10])}"
         if fail_count > 10:
             msg += f" 외 {fail_count-10}개"
-        # 원인 요약 추가
         if failed_details:
             from collections import Counter
             rc = Counter(d["reason"] for d in failed_details)
@@ -1213,37 +1219,6 @@ send_telegram(msg)
 # ====================================================
 # ✅ 콜 거래량 급등 감지 → 완료 메시지 다음에 별도 전송
 # ====================================================
-def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol: int = 500) -> list:
-    """
-    call_vol / call_oi >= threshold 이고 call_vol >= min_call_vol 인 종목 탐지.
-    pcr_vol < 0.5 조건도 함께 체크 (콜 거래량이 풋의 2배 이상).
-    """
-    surges = []
-    for row in results:
-        call_vol = row.get("call_vol") or 0
-        call_oi  = row.get("call_oi")  or 0
-        pcr_vol  = row.get("pcr_vol")
-
-        if call_vol < min_call_vol:
-            continue
-        if call_oi <= 0:
-            continue
-
-        ratio = call_vol / call_oi
-        if ratio < vol_oi_threshold:
-            continue
-
-        surges.append({
-            "symbol":   row["symbol"],
-            "call_vol": int(call_vol),
-            "call_oi":  int(call_oi),
-            "ratio":    round(ratio, 2),
-            "pcr_vol":  pcr_vol,
-        })
-
-    surges.sort(key=lambda x: x["ratio"], reverse=True)
-    return surges
-
 if results:
     call_surges = detect_call_surge(results)
     if call_surges:
