@@ -1,5 +1,7 @@
 import os
 import io
+from dotenv import load_dotenv
+load_dotenv(r"C:\1234\.env")
 import requests
 import pandas as pd
 import yfinance as yf
@@ -82,8 +84,8 @@ print(f"✅ 오늘({today}) 장 운영일 확인")
 # ====================================================
 # ✅ API 초기화
 # ====================================================
-API_KEY      = os.getenv("ALPACA_API_KEY")
-SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
+API_KEY      = os.getenv("ALPACA_KEY")
+SECRET_KEY   = os.getenv("ALPACA_SECRET")
 opt_client   = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
@@ -446,10 +448,7 @@ def collect_data(symbol: str):
         pcr_oi   = oi_m["pcr_oi"]   if oi_m else None
         pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
         max_pain = oi_m["max_pain"] if oi_m else None
-        top_call_strike = oi_m.get("top_call_strike") if oi_m else None  # ✅ 추가
-        top_call_bid    = oi_m.get("top_call_bid")    if oi_m else None  # ✅ 추가
-        top_call_ask    = oi_m.get("top_call_ask")    if oi_m else None  # ✅ 추가
-        top_call_volume = oi_m.get("top_call_volume") if oi_m else None  # ✅ 추가
+        # top_call_strike/bid/ask/volume은 Alpaca 체인 기반으로 아래에서 계산 (yfinance는 bid/ask가 0으로 깨지는 문제 있음)
 
         alpaca_symbol = symbol.replace("-", ".")
         try:
@@ -488,10 +487,37 @@ def collect_data(symbol: str):
         call_deltas = []; put_deltas = []
         gammas = []; thetas = []; vegas = []; rhos = []
 
+        # ── 최다거래 콜 옵션의 strike/bid/ask/volume (Alpaca 체인 기반) ──
+        top_call_strike = top_call_bid = top_call_ask = top_call_volume = None
+        best_call_vol = -1
+
         for opt in filtered:
             iv       = getattr(opt, "implied_volatility", None)
             opt_type = opt.symbol[-9]
             greeks   = getattr(opt, "greeks", None)
+
+            # 콜옵션 거래량 기준 최다거래 옵션 추적 (Alpaca daily_bar 사용)
+            if opt_type == "C":
+                daily_bar = getattr(opt, "daily_bar", None)
+                vol = getattr(daily_bar, "volume", None) if daily_bar else None
+                if vol is not None:
+                    try:
+                        vol = int(vol)
+                    except Exception:
+                        vol = None
+                if vol is not None and vol > best_call_vol:
+                    best_call_vol = vol
+                    try:
+                        strike = round(int(opt.symbol[-8:]) / 1000, 1)
+                    except Exception:
+                        strike = None
+                    quote = getattr(opt, "latest_quote", None)
+                    bid = getattr(quote, "bid_price", None) if quote else None
+                    ask = getattr(quote, "ask_price", None) if quote else None
+                    top_call_strike = strike
+                    top_call_bid    = float(bid) if bid is not None else None
+                    top_call_ask    = float(ask) if ask is not None else None
+                    top_call_volume = vol
 
             if greeks is not None:
                 delta = getattr(greeks, "delta", None)
@@ -1282,8 +1308,12 @@ if results:
             if s.get("top_call_strike") is not None:
                 bid = s.get("top_call_bid")
                 ask = s.get("top_call_ask")
-                bid_str = f"{bid:.2f}" if bid is not None else "N/A"
-                ask_str = f"{ask:.2f}" if ask is not None else "N/A"
+                # ✅ bid/ask가 둘 다 0이면 실제 호가가 아니라 데이터 결측(유동성 부족)일 가능성이 높음
+                if (bid is None or bid == 0) and (ask is None or ask == 0):
+                    bid_str = ask_str = "호가없음"
+                else:
+                    bid_str = f"{bid:.2f}" if bid is not None else "N/A"
+                    ask_str = f"{ask:.2f}" if ask is not None else "N/A"
                 lines.append(
                     f"   └ 최다거래 콜 Strike={s['top_call_strike']}  "
                     f"Bid={bid_str}  Ask={ask_str}  Vol={s.get('top_call_volume', 'N/A')}"
