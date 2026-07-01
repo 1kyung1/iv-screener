@@ -394,6 +394,9 @@ def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_d
 #    - "오늘 하루 전체 체결"이 아니라 "장마감 시점 마지막 체결가"가
 #      bid/ask 중 어디에 더 가까웠는지를 보는 근사치임 (한계 있음)
 # ====================================================
+STALE_TRADE_SECONDS = 900   # quote 시각과 체결 시각이 이보다 더 벌어지면 "오래된 체결"로 간주해 제외
+MIN_CONTRACT_PRICE  = 0.05  # ask가 이보다 낮은 로또성 딥아웃오브더머니 계약은 노이즈가 커서 제외
+
 def classify_trade_side(bid: float, ask: float, trade_price: float,
                          buy_zone: float = 0.6, sell_zone: float = 0.4):
     """
@@ -428,9 +431,16 @@ def analyze_near_term_call_flow(options: list, exp_key: str = None,
     만기와 '동일한 만기'만 대상으로 삼아 call_vol_st와 buy_ratio_st가
     같은 대상을 가리키도록 함. exp_key가 없으면 DTE 범위 전체를 봄.
 
-    call_no_quote_cnt_st: bid/ask 또는 체결가가 없어서 판단 불가했던 계약 수.
-    이 값이 크면 Alpaca 무료(indicative) feed 특성상 quote 데이터 자체가
-    없는 경우이니, "매수비율=None" 이 버그가 아니라 데이터 공백 때문임을 알 수 있음.
+    ⚠️ 필터링 근거 (실제 AAPL 테스트에서 발견된 문제):
+    - 딥아웃오브더머니 로또성 계약(bid=0, ask=0.01~0.03)은 latest_trade가
+      latest_quote보다 훨씬 예전 체결인 경우가 흔해서, 체결가가 현재
+      ask보다도 높게 나오는(pos>1) 왜곡된 결과가 나옴. → MIN_CONTRACT_PRICE로 제외.
+    - quote 시각과 trade 시각이 크게 벌어진 경우도 같은 이유로 신뢰 불가.
+      → STALE_TRADE_SECONDS로 제외.
+
+    call_no_quote_cnt_st: bid/ask 또는 체결가가 없거나(quote 자체 부재),
+    로또성/오래된 체결이라 판단 불가했던 계약 수. 이 값이 크면 데이터가
+    없는 게 아니라 "신뢰할 수 없어서 제외"한 것일 수 있음.
     """
     buy_cnt = sell_cnt = mid_cnt = no_quote_cnt = 0
     buy_notional = sell_notional = 0.0
@@ -452,10 +462,31 @@ def analyze_near_term_call_flow(options: list, exp_key: str = None,
 
         quote = getattr(opt, "latest_quote", None)
         trade = getattr(opt, "latest_trade", None)
-        bid   = getattr(quote, "bid_price", None) if quote is not None else None
-        ask   = getattr(quote, "ask_price", None) if quote is not None else None
-        price = getattr(trade, "price", None) if trade is not None else None
-        size  = (getattr(trade, "size", None) or 0) if trade is not None else 0
+        if quote is None or trade is None:
+            no_quote_cnt += 1
+            continue
+
+        bid   = getattr(quote, "bid_price", None)
+        ask   = getattr(quote, "ask_price", None)
+        price = getattr(trade, "price", None)
+        size  = getattr(trade, "size", None) or 0
+
+        # ✅ 로또성 딥아웃오브더머니 계약 제외 (bid/ask 왜곡이 심함)
+        if ask is None or ask < MIN_CONTRACT_PRICE:
+            no_quote_cnt += 1
+            continue
+
+        # ✅ 체결이 현재 호가보다 너무 오래됐으면 제외 (stale trade)
+        quote_ts = getattr(quote, "timestamp", None)
+        trade_ts = getattr(trade, "timestamp", None)
+        if quote_ts is not None and trade_ts is not None:
+            try:
+                age_sec = abs((quote_ts - trade_ts).total_seconds())
+                if age_sec > STALE_TRADE_SECONDS:
+                    no_quote_cnt += 1
+                    continue
+            except Exception:
+                pass
 
         if bid is not None and ask is not None and ask > bid:
             bid_sum += bid
@@ -481,6 +512,8 @@ def analyze_near_term_call_flow(options: list, exp_key: str = None,
 
     directional = buy_cnt + sell_cnt
     buy_ratio_st = round(buy_cnt / directional, 4) if directional > 0 else None
+    total_notional = buy_notional + sell_notional
+    buy_notional_ratio_st = round(buy_notional / total_notional, 4) if total_notional > 0 else None
     avg_bid = round(bid_sum / bid_ask_cnt, 4) if bid_ask_cnt > 0 else None
     avg_ask = round(ask_sum / bid_ask_cnt, 4) if bid_ask_cnt > 0 else None
     avg_spread_pct = None
@@ -494,6 +527,7 @@ def analyze_near_term_call_flow(options: list, exp_key: str = None,
         "call_checked_cnt_st":   checked,
         "call_no_quote_cnt_st":  no_quote_cnt,
         "call_buy_ratio_st":     buy_ratio_st,
+        "call_buy_notional_ratio_st": buy_notional_ratio_st,  # ✅ 계약수 대신 금액(계약수×체결가×100) 기준 비율
         "call_buy_notional_st":  round(buy_notional, 2),
         "call_avg_bid_st":       avg_bid,
         "call_avg_ask_st":       avg_ask,
@@ -765,7 +799,8 @@ def collect_data(symbol: str):
             "call_vol_st":    call_vol_st,    # ✅ 근월물 콜 거래량
             "put_vol_st":     put_vol_st,     # ✅ 근월물 풋 거래량
             "pcr_vol_st":     pcr_vol_st,     # ✅ 근월물 PCR(거래량 기준)
-            "call_buy_ratio_st":    flow_st["call_buy_ratio_st"],    # ✅ 매수주도 비율(근사)
+            "call_buy_ratio_st":    flow_st["call_buy_ratio_st"],    # ✅ 매수주도 비율(근사, 계약수 기준)
+            "call_buy_notional_ratio_st": flow_st["call_buy_notional_ratio_st"],  # ✅ 금액 기준 매수비율
             "call_buy_cnt_st":      flow_st["call_buy_cnt_st"],
             "call_sell_cnt_st":     flow_st["call_sell_cnt_st"],
             "call_checked_cnt_st":  flow_st["call_checked_cnt_st"],
@@ -1061,7 +1096,7 @@ IV_COL_ORDER = [
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "call_vol", "put_vol",   # ✅ 추가
     "call_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st",           # ✅ 단기(근월물, 최근접 만기)
-    "call_buy_ratio_st", "call_buy_cnt_st", "call_sell_cnt_st",        # ✅ 매수주도 근사
+    "call_buy_ratio_st", "call_buy_notional_ratio_st", "call_buy_cnt_st", "call_sell_cnt_st",  # ✅ 매수주도 근사
     "call_checked_cnt_st", "call_no_quote_cnt_st", "call_buy_notional_st",
     "call_avg_bid_st", "call_avg_ask_st", "call_avg_spread_pct_st",    # ✅ 실제 bid/ask 값
     "max_pain", "pain_diff",
@@ -1243,6 +1278,7 @@ def detect_buyside_call_surge(results: list, vol_oi_threshold: float = 1.5,
         call_vol_st = row.get("call_vol_st") or 0
         call_oi_st  = row.get("call_oi_st")  or 0
         buy_ratio   = row.get("call_buy_ratio_st")
+        buy_ratio_notional = row.get("call_buy_notional_ratio_st")
         checked     = row.get("call_checked_cnt_st") or 0
         buy_cnt     = row.get("call_buy_cnt_st") or 0
         sell_cnt    = row.get("call_sell_cnt_st") or 0
@@ -1270,6 +1306,7 @@ def detect_buyside_call_surge(results: list, vol_oi_threshold: float = 1.5,
             "call_oi_st":   int(call_oi_st),
             "ratio":        round(ratio, 2),
             "buy_ratio":    buy_ratio,
+            "buy_ratio_notional": buy_ratio_notional,
             "buy_cnt":      buy_cnt,
             "sell_cnt":     sell_cnt,
             "pcr_vol_st":   pcr_vol_st,
@@ -1511,9 +1548,12 @@ if results:
                           f"(스프레드{s['avg_spread']}%)"
                           if s["avg_bid"] is not None and s["avg_ask"] is not None
                           else "bid/ask=N/A")
+            notional_str = (f"금액기준={s['buy_ratio_notional']*100:.0f}%"
+                             if s["buy_ratio_notional"] is not None else "금액기준=N/A")
             lines.append(
                 f"• <b>{s['symbol']}</b>  "
-                f"매수비율={s['buy_ratio']*100:.0f}% (매수{s['buy_cnt']}/매도{s['sell_cnt']})  "
+                f"매수비율={s['buy_ratio']*100:.0f}% ({notional_str}) "
+                f"(매수{s['buy_cnt']}/매도{s['sell_cnt']})  "
                 f"콜거래량={s['call_vol_st']:,}  OI={s['call_oi_st']:,}  "
                 f"비율={s['ratio']}x  {pcr_str}\n"
                 f"  {bidask_str}"
