@@ -339,43 +339,49 @@ NEAR_TERM_MIN_DTE = 0
 
 def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_dte: int = NEAR_TERM_MAX_DTE):
     """
-    min_dte~max_dte 사이의 '모든' 만기를 합산해서
-    그날 단기 콜/풋 거래량·OI를 계산.
-    (yfinance 호출이 만기 개수만큼 늘어남 — 종목당 보통 1~3개 만기)
+    min_dte~max_dte 범위에서 '가장 가까운 만기 하나'를 골라 콜/풋 거래량·OI를 계산.
+    ⚠️ 이전 버전은 범위 내 모든 만기를 합산했는데, 그러면 종목마다 근월물
+    만기 개수(위클리 유무 등)가 달라서 종목 간 비교가 왜곡됨.
+    또한 이 함수가 고른 만기(exp_key)를 analyze_near_term_call_flow에도
+    그대로 넘겨서 두 지표(거래량 vs 매수비율)가 같은 대상을 가리키게 함.
     """
     try:
         exps = yf_ticker.options
         if not exps:
             return None
 
-        target_exps = []
-        for exp in exps:
+        target_exp = None
+        target_dte = None
+        for exp in exps:   # yfinance는 만기를 날짜순으로 정렬해서 반환
             dte = (pd.Timestamp(exp).date() - today_date).days
             if min_dte <= dte <= max_dte:
-                target_exps.append(exp)
+                target_exp = exp
+                target_dte = dte
+                break
 
-        if not target_exps:
+        if not target_exp:
             return None
 
-        call_oi = call_vol = put_oi = put_vol = 0
-        for exp in target_exps:
-            chain = yf_ticker.option_chain(exp)
-            calls = chain.calls
-            puts  = chain.puts
-            call_oi  += int(calls["openInterest"].fillna(0).sum())
-            put_oi   += int(puts["openInterest"].fillna(0).sum())
-            call_vol += int(calls["volume"].fillna(0).sum())
-            put_vol  += int(puts["volume"].fillna(0).sum())
+        chain = yf_ticker.option_chain(target_exp)
+        calls = chain.calls
+        puts  = chain.puts
+        call_oi  = int(calls["openInterest"].fillna(0).sum())
+        put_oi   = int(puts["openInterest"].fillna(0).sum())
+        call_vol = int(calls["volume"].fillna(0).sum())
+        put_vol  = int(puts["volume"].fillna(0).sum())
 
         pcr_vol = round(put_vol / call_vol, 4) if call_vol > 0 else None
+        exp_key = pd.Timestamp(target_exp).strftime("%y%m%d")  # Alpaca 심볼의 만기 포맷과 동일
 
         return {
-            "call_oi_st":  call_oi,
-            "put_oi_st":   put_oi,
-            "call_vol_st": call_vol,
-            "put_vol_st":  put_vol,
-            "pcr_vol_st":  pcr_vol,
-            "exps_used_st": ",".join(target_exps),
+            "call_oi_st":   call_oi,
+            "put_oi_st":    put_oi,
+            "call_vol_st":  call_vol,
+            "put_vol_st":   put_vol,
+            "pcr_vol_st":   pcr_vol,
+            "target_exp_st": target_exp,
+            "exp_key_st":   exp_key,
+            "dte_st":       target_dte,
         }
     except Exception as e:
         print(f"    [yf 단기 OI 실패] {e}")
@@ -411,15 +417,26 @@ def classify_trade_side(bid: float, ask: float, trade_price: float,
         return None
 
 
-def analyze_near_term_call_flow(options: list, min_dte: int = NEAR_TERM_MIN_DTE,
+def analyze_near_term_call_flow(options: list, exp_key: str = None,
+                                 min_dte: int = NEAR_TERM_MIN_DTE,
                                  max_dte: int = NEAR_TERM_MAX_DTE):
     """
     Alpaca 옵션체인(options)에서 근월물 콜만 골라
     latest_quote(bid/ask) vs latest_trade(price)로 매수/매도 주도 여부를 집계.
+
+    exp_key(YYMMDD, 예: "260710")를 넘기면 calc_near_term_oi_metrics가 고른
+    만기와 '동일한 만기'만 대상으로 삼아 call_vol_st와 buy_ratio_st가
+    같은 대상을 가리키도록 함. exp_key가 없으면 DTE 범위 전체를 봄.
+
+    call_no_quote_cnt_st: bid/ask 또는 체결가가 없어서 판단 불가했던 계약 수.
+    이 값이 크면 Alpaca 무료(indicative) feed 특성상 quote 데이터 자체가
+    없는 경우이니, "매수비율=None" 이 버그가 아니라 데이터 공백 때문임을 알 수 있음.
     """
-    buy_cnt = sell_cnt = mid_cnt = 0
+    buy_cnt = sell_cnt = mid_cnt = no_quote_cnt = 0
     buy_notional = sell_notional = 0.0
     checked = 0
+    bid_sum = ask_sum = 0.0
+    bid_ask_cnt = 0
 
     for opt in options:
         dte = days_to_expiry(opt.symbol)
@@ -428,19 +445,26 @@ def analyze_near_term_call_flow(options: list, min_dte: int = NEAR_TERM_MIN_DTE,
         opt_type = opt.symbol[-9]
         if opt_type != "C":
             continue
+        if exp_key is not None:
+            sym_exp_key = opt.symbol[-15:-9]
+            if sym_exp_key != exp_key:
+                continue
 
         quote = getattr(opt, "latest_quote", None)
         trade = getattr(opt, "latest_trade", None)
-        if quote is None or trade is None:
-            continue
+        bid   = getattr(quote, "bid_price", None) if quote is not None else None
+        ask   = getattr(quote, "ask_price", None) if quote is not None else None
+        price = getattr(trade, "price", None) if trade is not None else None
+        size  = (getattr(trade, "size", None) or 0) if trade is not None else 0
 
-        bid = getattr(quote, "bid_price", None)
-        ask = getattr(quote, "ask_price", None)
-        price = getattr(trade, "price", None)
-        size  = getattr(trade, "size", None) or 0
+        if bid is not None and ask is not None and ask > bid:
+            bid_sum += bid
+            ask_sum += ask
+            bid_ask_cnt += 1
 
         side = classify_trade_side(bid, ask, price)
         if side is None:
+            no_quote_cnt += 1
             continue
 
         checked += 1
@@ -457,14 +481,23 @@ def analyze_near_term_call_flow(options: list, min_dte: int = NEAR_TERM_MIN_DTE,
 
     directional = buy_cnt + sell_cnt
     buy_ratio_st = round(buy_cnt / directional, 4) if directional > 0 else None
+    avg_bid = round(bid_sum / bid_ask_cnt, 4) if bid_ask_cnt > 0 else None
+    avg_ask = round(ask_sum / bid_ask_cnt, 4) if bid_ask_cnt > 0 else None
+    avg_spread_pct = None
+    if avg_bid is not None and avg_ask is not None and (avg_bid + avg_ask) > 0:
+        avg_spread_pct = round((avg_ask - avg_bid) / ((avg_ask + avg_bid) / 2) * 100, 2)
 
     return {
-        "call_buy_cnt_st":      buy_cnt,
-        "call_sell_cnt_st":     sell_cnt,
-        "call_mid_cnt_st":      mid_cnt,
-        "call_checked_cnt_st":  checked,
-        "call_buy_ratio_st":    buy_ratio_st,
-        "call_buy_notional_st": round(buy_notional, 2),
+        "call_buy_cnt_st":       buy_cnt,
+        "call_sell_cnt_st":      sell_cnt,
+        "call_mid_cnt_st":       mid_cnt,
+        "call_checked_cnt_st":   checked,
+        "call_no_quote_cnt_st":  no_quote_cnt,
+        "call_buy_ratio_st":     buy_ratio_st,
+        "call_buy_notional_st":  round(buy_notional, 2),
+        "call_avg_bid_st":       avg_bid,
+        "call_avg_ask_st":       avg_ask,
+        "call_avg_spread_pct_st": avg_spread_pct,
     }
 
 
@@ -556,12 +589,13 @@ def collect_data(symbol: str):
         pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
         max_pain = oi_m["max_pain"] if oi_m else None
 
-        # ✅ 단기(근월물) 콜/풋 거래량·OI (yfinance, 0~21일 만기 전체 합산)
+        # ✅ 단기(근월물) 콜/풋 거래량·OI (yfinance, 가장 가까운 만기 하나)
         oi_st       = calc_near_term_oi_metrics(yf_ticker)
         call_oi_st  = oi_st["call_oi_st"]  if oi_st else 0
         call_vol_st = oi_st["call_vol_st"] if oi_st else 0
         put_vol_st  = oi_st["put_vol_st"]  if oi_st else 0
         pcr_vol_st  = oi_st["pcr_vol_st"]  if oi_st else None
+        exp_key_st  = oi_st["exp_key_st"]  if oi_st else None
 
         alpaca_symbol = symbol.replace("-", ".")
         try:
@@ -579,7 +613,8 @@ def collect_data(symbol: str):
             return {"_fail_reason": "ALPACA_EMPTY", "_fail_detail": "옵션체인 응답이 비어있음"}
 
         # ✅ 근월물 콜 매수/매도 주도 근사 (Alpaca bid/ask, 무료 indicative feed)
-        flow_st = analyze_near_term_call_flow(options)
+        #    exp_key_st를 넘겨서 위 call_vol_st/call_oi_st와 '같은 만기'만 봄
+        flow_st = analyze_near_term_call_flow(options, exp_key=exp_key_st)
 
         all_dtes = sorted(set(days_to_expiry(opt.symbol) for opt in options))
         print(f"    [DTE분포] {symbol}: {all_dtes[:10]}{'...' if len(all_dtes)>10 else ''}")
@@ -734,7 +769,11 @@ def collect_data(symbol: str):
             "call_buy_cnt_st":      flow_st["call_buy_cnt_st"],
             "call_sell_cnt_st":     flow_st["call_sell_cnt_st"],
             "call_checked_cnt_st":  flow_st["call_checked_cnt_st"],
+            "call_no_quote_cnt_st": flow_st["call_no_quote_cnt_st"],  # ✅ quote 없어서 판단불가한 계약수
             "call_buy_notional_st": flow_st["call_buy_notional_st"],
+            "call_avg_bid_st":      flow_st["call_avg_bid_st"],       # ✅ 실제 평균 bid
+            "call_avg_ask_st":      flow_st["call_avg_ask_st"],       # ✅ 실제 평균 ask
+            "call_avg_spread_pct_st": flow_st["call_avg_spread_pct_st"],
             "max_pain":       max_pain,
             "pain_diff":      pain_diff,
             "rsi14":          rsi,
@@ -1021,9 +1060,10 @@ IV_COL_ORDER = [
     "gex", "gex_call", "gex_put", "dex",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "call_vol", "put_vol",   # ✅ 추가
-    "call_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st",           # ✅ 단기(근월물)
+    "call_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st",           # ✅ 단기(근월물, 최근접 만기)
     "call_buy_ratio_st", "call_buy_cnt_st", "call_sell_cnt_st",        # ✅ 매수주도 근사
-    "call_checked_cnt_st", "call_buy_notional_st",
+    "call_checked_cnt_st", "call_no_quote_cnt_st", "call_buy_notional_st",
+    "call_avg_bid_st", "call_avg_ask_st", "call_avg_spread_pct_st",    # ✅ 실제 bid/ask 값
     "max_pain", "pain_diff",
     "rsi14", "beta", "week52_pos", "vol_ratio",
     "ret_1d", "ret_5d", "ret_20d", "atr14",
@@ -1207,6 +1247,9 @@ def detect_buyside_call_surge(results: list, vol_oi_threshold: float = 1.5,
         buy_cnt     = row.get("call_buy_cnt_st") or 0
         sell_cnt    = row.get("call_sell_cnt_st") or 0
         pcr_vol_st  = row.get("pcr_vol_st")
+        avg_bid     = row.get("call_avg_bid_st")
+        avg_ask     = row.get("call_avg_ask_st")
+        avg_spread  = row.get("call_avg_spread_pct_st")
 
         if call_vol_st < min_call_vol:
             continue
@@ -1230,6 +1273,9 @@ def detect_buyside_call_surge(results: list, vol_oi_threshold: float = 1.5,
             "buy_cnt":      buy_cnt,
             "sell_cnt":     sell_cnt,
             "pcr_vol_st":   pcr_vol_st,
+            "avg_bid":      avg_bid,
+            "avg_ask":      avg_ask,
+            "avg_spread":   avg_spread,
         })
 
     # 매수주도 비율 우선, 그다음 거래량/OI 비율 순
@@ -1300,7 +1346,9 @@ for i, symbol in enumerate(symbols):
         f"gex={row['gex']} | dex={row['dex']} | "
         f"call_vol={row['call_vol']} | put_vol={row['put_vol']} | "
         f"call_vol_st={row.get('call_vol_st')} | call_oi_st={row.get('call_oi_st')} | "
-        f"buy_ratio_st={row.get('call_buy_ratio_st')}"  # ✅ 로그 추가
+        f"buy_ratio_st={row.get('call_buy_ratio_st')} | "
+        f"bid={row.get('call_avg_bid_st')} | ask={row.get('call_avg_ask_st')} | "
+        f"no_quote={row.get('call_no_quote_cnt_st')}"  # ✅ 로그 추가 (디버깅용)
     )
     time.sleep(0.3)
 
@@ -1456,20 +1504,34 @@ if results:
     buyside_surges = detect_buyside_call_surge(results)
     if buyside_surges:
         lines = [f"🎯 <b>단기 콜 매수주도 급등 감지</b> — {today}",
-                 f"(근월물 0~{NEAR_TERM_MAX_DTE}일 · bid/ask 근사 · 참고용 지표)\n"]
+                 f"(근월물 최근접 만기 · bid/ask 근사 · 참고용 지표)\n"]
         for s in buyside_surges[:15]:
-            pcr_str = f"PCR={s['pcr_vol_st']:.2f}" if s["pcr_vol_st"] else "PCR=N/A"
+            pcr_str    = f"PCR={s['pcr_vol_st']:.2f}" if s["pcr_vol_st"] else "PCR=N/A"
+            bidask_str = (f"bid={s['avg_bid']:.2f}/ask={s['avg_ask']:.2f}"
+                          f"(스프레드{s['avg_spread']}%)"
+                          if s["avg_bid"] is not None and s["avg_ask"] is not None
+                          else "bid/ask=N/A")
             lines.append(
                 f"• <b>{s['symbol']}</b>  "
                 f"매수비율={s['buy_ratio']*100:.0f}% (매수{s['buy_cnt']}/매도{s['sell_cnt']})  "
                 f"콜거래량={s['call_vol_st']:,}  OI={s['call_oi_st']:,}  "
-                f"비율={s['ratio']}x  {pcr_str}"
+                f"비율={s['ratio']}x  {pcr_str}\n"
+                f"  {bidask_str}"
             )
         if len(buyside_surges) > 15:
             lines.append(f"... 외 {len(buyside_surges)-15}개")
         send_telegram("\n".join(lines))
         print(f"  📡 단기 콜 매수주도 급등 {len(buyside_surges)}개 전송 완료")
     else:
-        print("  ℹ️ 단기 콜 매수주도 급등 종목 없음")
+        # ✅ 진단용: 왜 못 잡았는지 콘솔에서 바로 확인 가능하도록
+        checked_vals   = [r.get("call_checked_cnt_st") or 0 for r in results]
+        no_quote_vals  = [r.get("call_no_quote_cnt_st") or 0 for r in results]
+        total_checked  = sum(checked_vals)
+        total_no_quote = sum(no_quote_vals)
+        print(
+            "  ℹ️ 단기 콜 매수주도 급등 종목 없음 "
+            f"(전체 표본합계 checked={total_checked}, quote없음={total_no_quote} "
+            f"→ quote없음 비율이 높으면 Alpaca 무료 feed의 커버리지 한계일 가능성)"
+        )
 
 print("=== IV Data Collector DONE ===")
