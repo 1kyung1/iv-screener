@@ -273,20 +273,6 @@ def calc_oi_metrics(yf_ticker):
                     target_exp = exp
                     break
         if not target_exp:
-            # ✅ 30~45/25~50일 범위에 만기가 없으면 가장 가까운 "충분한 유동성 기대 가능한" 만기로 자동 조정
-            #    단, 너무 임박한 만기(예: 1~2일 후 weekly)는 OI가 거의 없어 비율이 왜곡되므로 제외.
-            #    최소 7일 이상 남은 만기 중 가장 가까운 것을 사용.
-            MIN_DTE_FALLBACK = 7
-            future_exps = []
-            for exp in exps:
-                dte = (pd.Timestamp(exp).date() - today_date).days
-                if dte >= MIN_DTE_FALLBACK:
-                    future_exps.append((dte, exp))
-            if future_exps:
-                future_exps.sort(key=lambda x: x[0])
-                target_exp = future_exps[0][1]
-                print(f"    [yf OI 만기 자동조정] {future_exps[0][0]}일 만기 사용")
-        if not target_exp:
             return None
 
         chain    = yf_ticker.option_chain(target_exp)
@@ -332,28 +318,11 @@ def calc_oi_metrics(yf_ticker):
         except Exception:
             max_pain = None
 
-        # ── 가장 거래량 많은 콜 옵션 1개의 strike/bid/ask 추출 ──
-        top_call_strike = top_call_bid = top_call_ask = top_call_volume = None
-        try:
-            calls_valid = calls[calls["volume"].fillna(0) > 0]
-            if not calls_valid.empty:
-                top_row = calls_valid.loc[calls_valid["volume"].idxmax()]
-                top_call_strike = float(top_row["strike"])
-                top_call_bid    = float(top_row["bid"]) if not pd.isna(top_row.get("bid")) else None
-                top_call_ask    = float(top_row["ask"]) if not pd.isna(top_row.get("ask")) else None
-                top_call_volume = int(top_row["volume"]) if not pd.isna(top_row["volume"]) else None
-        except Exception as e:
-            print(f"    [top call bid/ask 추출 실패] {e}")
-
         return {
             "call_oi":  call_oi, "put_oi":   put_oi,
             "call_vol": call_vol, "put_vol":  put_vol,
             "pcr_oi":   pcr_oi,  "pcr_vol":  pcr_vol,
             "max_pain": max_pain,
-            "top_call_strike": top_call_strike,
-            "top_call_bid":    top_call_bid,
-            "top_call_ask":    top_call_ask,
-            "top_call_volume": top_call_volume,
         }
     except Exception as e:
         print(f"    [yf OI 실패] {e}")
@@ -446,10 +415,6 @@ def collect_data(symbol: str):
         pcr_oi   = oi_m["pcr_oi"]   if oi_m else None
         pcr_vol  = oi_m["pcr_vol"]  if oi_m else None
         max_pain = oi_m["max_pain"] if oi_m else None
-        top_call_strike = oi_m.get("top_call_strike") if oi_m else None  # ✅ 추가
-        top_call_bid    = oi_m.get("top_call_bid")    if oi_m else None  # ✅ 추가
-        top_call_ask    = oi_m.get("top_call_ask")    if oi_m else None  # ✅ 추가
-        top_call_volume = oi_m.get("top_call_volume") if oi_m else None  # ✅ 추가
 
         alpaca_symbol = symbol.replace("-", ".")
         try:
@@ -611,10 +576,6 @@ def collect_data(symbol: str):
             "put_oi":         put_oi,
             "call_vol":       call_vol,   # ✅ 추가 (콜 급등 감지에 필요)
             "put_vol":        put_vol,    # ✅ 추가
-            "top_call_strike": top_call_strike,  # ✅ 추가 (Ask/Bid 알림용)
-            "top_call_bid":    top_call_bid,     # ✅ 추가
-            "top_call_ask":    top_call_ask,     # ✅ 추가
-            "top_call_volume": top_call_volume,  # ✅ 추가
             "max_pain":       max_pain,
             "pain_diff":      pain_diff,
             "rsi14":          rsi,
@@ -901,7 +862,6 @@ IV_COL_ORDER = [
     "gex", "gex_call", "gex_put", "dex",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "call_vol", "put_vol",   # ✅ 추가
-    "top_call_strike", "top_call_bid", "top_call_ask", "top_call_volume",   # ✅ 추가
     "max_pain", "pain_diff",
     "rsi14", "beta", "week52_pos", "vol_ratio",
     "ret_1d", "ret_5d", "ret_20d", "atr14",
@@ -1032,11 +992,9 @@ def check_market_data_quality(market_row: dict) -> list:
 # ====================================================
 # ✅ 콜 거래량 급등 감지
 # ====================================================
-def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol: int = 500, min_call_oi: int = 10) -> list:
+def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol: int = 500) -> list:
     """
     call_vol / call_oi >= threshold 이고 call_vol >= min_call_vol 인 종목 탐지.
-    call_oi가 극단적으로 작으면(1~수개) 비율이 통계적으로 왜곡되므로 최소한의 노이즈 필터만 적용.
-    → min_call_oi를 너무 높이면 "오늘 실제로 거래가 몰린" 진짜 신호까지 놓칠 수 있어 낮게 유지.
     비율 높은 순으로 정렬하여 반환.
     """
     surges = []
@@ -1047,7 +1005,7 @@ def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol
 
         if call_vol < min_call_vol:
             continue
-        if call_oi < min_call_oi:   # ✅ 최소한의 노이즈 필터 (OI=1~9 같은 극단치만 제외)
+        if call_oi <= 0:
             continue
 
         ratio = call_vol / call_oi
@@ -1060,10 +1018,6 @@ def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol
             "call_oi":  int(call_oi),
             "ratio":    round(ratio, 2),
             "pcr_vol":  pcr_vol,
-            "top_call_strike": row.get("top_call_strike"),  # ✅ 추가
-            "top_call_bid":    row.get("top_call_bid"),      # ✅ 추가
-            "top_call_ask":    row.get("top_call_ask"),      # ✅ 추가
-            "top_call_volume": row.get("top_call_volume"),   # ✅ 추가
         })
 
     surges.sort(key=lambda x: x["ratio"], reverse=True)
@@ -1271,27 +1225,11 @@ if results:
         lines = [f"🚀 <b>콜 거래량 급등 감지</b> — {today}\n"]
         for s in call_surges[:15]:
             pcr_str = f"PCR={s['pcr_vol']:.2f}" if s["pcr_vol"] else "PCR=N/A"
-            # OI가 작은데 비율만 극단적으로 큰 경우 신뢰도 경고 표시
-            warn = " ⚠️OI낮음/신뢰도주의" if s["call_oi"] < 50 else ""
             lines.append(
                 f"• <b>{s['symbol']}</b>  "
                 f"콜거래량={s['call_vol']:,}  OI={s['call_oi']:,}  "
-                f"비율={s['ratio']}x  {pcr_str}{warn}"
+                f"비율={s['ratio']}x  {pcr_str}"
             )
-            # 최다거래 콜 옵션의 Strike/Bid/Ask 표시
-            if s.get("top_call_strike") is not None:
-                bid = s.get("top_call_bid")
-                ask = s.get("top_call_ask")
-                # ✅ bid/ask가 둘 다 0이면 실제 호가가 아니라 데이터 결측(유동성 부족)일 가능성이 높음
-                if (bid is None or bid == 0) and (ask is None or ask == 0):
-                    bid_str = ask_str = "호가없음"
-                else:
-                    bid_str = f"{bid:.2f}" if bid is not None else "N/A"
-                    ask_str = f"{ask:.2f}" if ask is not None else "N/A"
-                lines.append(
-                    f"   └ 최다거래 콜 Strike={s['top_call_strike']}  "
-                    f"Bid={bid_str}  Ask={ask_str}  Vol={s.get('top_call_volume', 'N/A')}"
-                )
         if len(call_surges) > 15:
             lines.append(f"... 외 {len(call_surges)-15}개")
         send_telegram("\n".join(lines))
