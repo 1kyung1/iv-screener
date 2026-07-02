@@ -426,7 +426,41 @@ def days_to_expiry(symbol: str) -> int:
 # ====================================================
 # ✅ yfinance OI/PCR/MaxPain
 # ====================================================
-def calc_oi_metrics(yf_ticker):
+# ====================================================
+# ✅ [수정] 최다 거래 콜 행사가의 bid/ask 정보 추출 (알림 표시용)
+#    - 6/29 버전에 있던 top_call_* 기능이 6/30 버전에서 빠졌던 것을 복원
+#    - yfinance 체인에 이미 bid/ask가 포함되어 있어 추가 API 호출 없음
+#    ⚠️ yfinance의 bid/ask는 장마감 후 '마지막 호가'라 0으로 지워져
+#       있을 수 있음 → 그 경우 lastPrice(마지막 체결가)를 대신 제공
+# ====================================================
+def _top_call_info(calls):
+    try:
+        if calls is None or calls.empty:
+            return {}
+        vol = calls["volume"].fillna(0)
+        if vol.max() <= 0:
+            return {}
+        r = calls.loc[vol.idxmax()]
+
+        def _f(x):
+            try:
+                x = float(x)
+                return round(x, 2) if x > 0 else None
+            except Exception:
+                return None
+
+        return {
+            "strike": _f(r.get("strike")),
+            "bid":    _f(r.get("bid")),
+            "ask":    _f(r.get("ask")),
+            "last":   _f(r.get("lastPrice")),
+            "volume": int(vol.max()),
+        }
+    except Exception:
+        return {}
+
+
+def calc_oi_metrics(yf_ticker, cur_price=None):
     try:
         exps = yf_ticker.options
         if not exps:
@@ -508,12 +542,36 @@ def calc_oi_metrics(yf_ticker):
         except Exception:
             max_pain = None
 
+        top = _top_call_info(calls)   # ✅ 최다 거래 콜 행사가 정보 (알림 표시용)
+
+        # ✅ [추가 2·3] 월물 콜 프리미엄 거래대금($) + OTM 콜 집중도
+        call_prem = None
+        try:
+            call_prem = int((calls["volume"].fillna(0) * calls["lastPrice"].fillna(0)).sum() * 100)
+        except Exception:
+            pass
+        otm_share = None
+        try:
+            if cur_price and call_vol > 0:
+                otm_vol   = calls.loc[calls["strike"] > cur_price, "volume"].fillna(0).sum()
+                otm_share = round(float(otm_vol) / call_vol, 4)
+        except Exception:
+            pass
+
         return {
             "call_oi":  call_oi, "put_oi":   put_oi,
             "call_vol": call_vol, "put_vol":  put_vol,
             "pcr_oi":   pcr_oi,  "pcr_vol":  pcr_vol,
             "max_pain": max_pain,
+            "call_prem": call_prem,           # ✅ [추가 2] 월물 콜 프리미엄 거래대금($)
+            "otm_call_share": otm_share,      # ✅ [추가 3] 월물 OTM 콜 거래량 비중(0~1)
             "oi_exp_dte": oi_dte,   # ✅ 어떤 만기(DTE)를 사용했는지 기록 (폴백 추적용)
+            "oi_exp_key": pd.Timestamp(target_exp).strftime("%y%m%d"),  # ✅ Alpaca 심볼 매칭용 만기 키
+            "top_call_strike": top.get("strike"),
+            "top_call_bid":    top.get("bid"),
+            "top_call_ask":    top.get("ask"),
+            "top_call_last":   top.get("last"),
+            "top_call_volume": top.get("volume"),
         }
     except Exception as e:
         print(f"    [yf OI 실패] {e}")
@@ -528,7 +586,8 @@ def calc_oi_metrics(yf_ticker):
 NEAR_TERM_MAX_DTE = 21   # 0~21일 남은 만기를 "단기"로 간주 (필요시 조정)
 NEAR_TERM_MIN_DTE = 0
 
-def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_dte: int = NEAR_TERM_MAX_DTE):
+def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_dte: int = NEAR_TERM_MAX_DTE,
+                              cur_price=None):
     """
     min_dte~max_dte 범위에서 '가장 가까운 만기 하나'를 골라 콜/풋 거래량·OI를 계산.
     ⚠️ 이전 버전은 범위 내 모든 만기를 합산했는데, 그러면 종목마다 근월물
@@ -564,15 +623,44 @@ def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_d
         pcr_vol = round(put_vol / call_vol, 4) if call_vol > 0 else None
         exp_key = pd.Timestamp(target_exp).strftime("%y%m%d")  # Alpaca 심볼의 만기 포맷과 동일
 
+        top = _top_call_info(calls)   # ✅ 최다 거래 콜 행사가 정보 (알림 표시용)
+
+        # ✅ [추가 2] 콜 프리미엄 거래대금($): Σ(거래량 × 마지막체결가 × 100)
+        #    계약 수만으로는 $0.05 로또콜 5천계약과 $5 콜 5천계약을 구분 못함.
+        #    "돈이 실린 급증"을 골라내는 필터. lastPrice는 체인에 이미 포함(추가 호출 없음)
+        call_prem = None
+        try:
+            call_prem = int((calls["volume"].fillna(0) * calls["lastPrice"].fillna(0)).sum() * 100)
+        except Exception:
+            pass
+
+        # ✅ [추가 3] OTM 콜 집중도: 현재가보다 높은 행사가의 콜 거래량 비중
+        #    인텔류 패턴의 특징인 "단기 + 외가격 콜 집중"(방향성 베팅)과
+        #    ATM 중심 헤지성 거래를 구분. cur_price 없으면 None
+        otm_share = None
+        try:
+            if cur_price and call_vol > 0:
+                otm_vol   = calls.loc[calls["strike"] > cur_price, "volume"].fillna(0).sum()
+                otm_share = round(float(otm_vol) / call_vol, 4)
+        except Exception:
+            pass
+
         return {
             "call_oi_st":   call_oi,
             "put_oi_st":    put_oi,
             "call_vol_st":  call_vol,
             "put_vol_st":   put_vol,
             "pcr_vol_st":   pcr_vol,
+            "call_prem_st": call_prem,   # ✅ [추가 2] 근월물 콜 프리미엄 거래대금($)
+            "otm_call_share_st": otm_share,  # ✅ [추가 3] 근월물 OTM 콜 거래량 비중(0~1)
             "target_exp_st": target_exp,
             "exp_key_st":   exp_key,
             "dte_st":       target_dte,
+            "top_call_strike_st": top.get("strike"),
+            "top_call_bid_st":    top.get("bid"),
+            "top_call_ask_st":    top.get("ask"),
+            "top_call_last_st":   top.get("last"),
+            "top_call_volume_st": top.get("volume"),
         }
     except Exception as e:
         print(f"    [yf 단기 OI 실패] {e}")
@@ -587,6 +675,31 @@ def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_d
 # ====================================================
 STALE_TRADE_SECONDS = 900   # quote 시각과 체결 시각이 이보다 더 벌어지면 "오래된 체결"로 간주해 제외
 MIN_CONTRACT_PRICE  = 0.05  # ask가 이보다 낮은 로또성 딥아웃오브더머니 계약은 노이즈가 커서 제외
+
+def _alpaca_topcall_quote(chain, underlying: str, exp_key: str, strike):
+    """
+    ✅ [수정] Alpaca 체인(dict: OCC심볼→스냅샷)에서 특정 만기/행사가 콜 계약의
+    bid/ask 조회. yfinance bid/ask는 장마감 후 소멸되지만 Alpaca latest_quote는
+    마지막 NBBO 스냅샷이 유지되므로 알림 표시용으로 더 신뢰할 수 있음.
+    (이미 받아온 체인에서 조회하므로 추가 API 호출 없음)
+    """
+    try:
+        if not exp_key or strike is None:
+            return None, None
+        root = underlying.replace("-", "").replace(".", "")
+        occ  = f"{root}{exp_key}C{int(round(float(strike) * 1000)):08d}"
+        snap = chain.get(occ)
+        if snap is None:
+            return None, None
+        q   = getattr(snap, "latest_quote", None)
+        bid = getattr(q, "bid_price", None) if q else None
+        ask = getattr(q, "ask_price", None) if q else None
+        bid = round(float(bid), 2) if bid else None   # 0 → None
+        ask = round(float(ask), 2) if ask else None
+        return bid, ask
+    except Exception:
+        return None, None
+
 
 def classify_trade_side(bid: float, ask: float, trade_price: float,
                          buy_zone: float = 0.6, sell_zone: float = 0.4):
@@ -802,13 +915,37 @@ def collect_data(symbol: str):
             atr_v = tr.rolling(14).mean().iloc[-1]
             atr14 = round(float(atr_v), 4) if not np.isnan(atr_v) else None
 
-        beta_val = get_ticker_info(symbol, "beta", ticker=yft)
-        beta = round(float(beta_val), 3) if beta_val is not None else None
+        # ✅ [추가 5·6] .info는 이미 베타 때문에 매일 1회 호출 중 →
+        #    같은 호출에서 공매도잔량·시총·섹터·배당락일까지 추출 (추가 API 호출 0건)
+        #    - short_pct_float: 콜 급증 + 높은 공매도 잔량 = 감마 스퀴즈 후보 조합
+        #    - market_cap/sector: 소형주일수록 같은 신호에 크게 반응 → 정규화·그룹 분석용
+        #    - days_to_exdiv: 배당락 직전 콜 매수(배당 캡처 전략) 노이즈 필터용
+        info = {}
+        try:
+            info = yft.info or {}
+        except Exception:
+            info = {}
+        beta_val  = info.get("beta")
+        beta      = round(float(beta_val), 3) if beta_val is not None else None
+        short_pct = info.get("shortPercentOfFloat")
+        short_pct = round(float(short_pct), 4) if short_pct is not None else None
+        market_cap = info.get("marketCap")
+        market_cap = int(market_cap) if market_cap else None
+        sector     = info.get("sector") or None
+        days_to_exdiv = None
+        try:
+            exdiv_ts = info.get("exDividendDate")
+            if exdiv_ts:
+                exdiv_d = pd.Timestamp(exdiv_ts, unit="s").date()
+                d = (exdiv_d - today_date).days
+                days_to_exdiv = d if d >= 0 else None   # 과거 배당락은 제외
+        except Exception:
+            pass
 
         days_to_earn = get_earnings_date(symbol, ticker=yft)
 
         yf_ticker = yft
-        oi_m       = calc_oi_metrics(yf_ticker)
+        oi_m       = calc_oi_metrics(yf_ticker, cur_price=cur_price)
         call_oi    = oi_m["call_oi"]  if oi_m else 0
         put_oi     = oi_m["put_oi"]   if oi_m else 0
         call_vol   = oi_m["call_vol"] if oi_m else 0  # ✅ 변수 보존
@@ -817,15 +954,28 @@ def collect_data(symbol: str):
         pcr_vol    = oi_m["pcr_vol"]  if oi_m else None
         max_pain   = oi_m["max_pain"] if oi_m else None
         oi_exp_dte = oi_m.get("oi_exp_dte") if oi_m else None
+        call_prem      = oi_m.get("call_prem")      if oi_m else None   # ✅ [추가 2]
+        otm_call_share = oi_m.get("otm_call_share") if oi_m else None   # ✅ [추가 3]
+        # ✅ 최다 거래 콜 행사가 정보 (월물)
+        top_call = {k: (oi_m.get(k) if oi_m else None)
+                    for k in ("top_call_strike", "top_call_bid", "top_call_ask",
+                              "top_call_last", "top_call_volume")}
 
         # ✅ 단기(근월물) 콜/풋 거래량·OI (yfinance, 가장 가까운 만기 하나)
-        oi_st       = calc_near_term_oi_metrics(yf_ticker)
+        oi_st       = calc_near_term_oi_metrics(yf_ticker, cur_price=cur_price)
         call_oi_st  = oi_st["call_oi_st"]  if oi_st else 0
+        put_oi_st   = oi_st["put_oi_st"]   if oi_st else 0   # ✅ [추가 1] 계산만 되고 저장 안 되던 풋 OI
         call_vol_st = oi_st["call_vol_st"] if oi_st else 0
         put_vol_st  = oi_st["put_vol_st"]  if oi_st else 0
         pcr_vol_st  = oi_st["pcr_vol_st"]  if oi_st else None
+        call_prem_st      = oi_st.get("call_prem_st")      if oi_st else None   # ✅ [추가 2]
+        otm_call_share_st = oi_st.get("otm_call_share_st") if oi_st else None   # ✅ [추가 3]
         exp_key_st  = oi_st["exp_key_st"]  if oi_st else None
         exp_st      = oi_st["target_exp_st"] if oi_st else None  # ✅ OI 전일比 비교 시 같은 만기인지 확인용
+        # ✅ 최다 거래 콜 행사가 정보 (근월물)
+        top_call_st = {k: (oi_st.get(k) if oi_st else None)
+                       for k in ("top_call_strike_st", "top_call_bid_st", "top_call_ask_st",
+                                 "top_call_last_st", "top_call_volume_st")}
 
         alpaca_symbol = symbol.replace("-", ".")
         try:
@@ -838,6 +988,20 @@ def collect_data(symbol: str):
 
         if not options:
             return {"_fail_reason": "ALPACA_EMPTY", "_fail_detail": "옵션체인 응답이 비어있음"}
+
+        # ✅ [수정] 주력행사가 bid/ask를 Alpaca 호가로 우선 교체
+        #    yfinance bid/ask는 장마감 후 소멸 → Alpaca latest_quote(마지막 NBBO) 우선,
+        #    Alpaca에도 없으면 yfinance 값 유지, 그것도 없으면 알림에서 체결가로 폴백.
+        a_bid, a_ask = _alpaca_topcall_quote(
+            chain, symbol, oi_m.get("oi_exp_key") if oi_m else None,
+            top_call.get("top_call_strike"))
+        if a_bid is not None: top_call["top_call_bid"] = a_bid
+        if a_ask is not None: top_call["top_call_ask"] = a_ask
+
+        a_bid_st, a_ask_st = _alpaca_topcall_quote(
+            chain, symbol, exp_key_st, top_call_st.get("top_call_strike_st"))
+        if a_bid_st is not None: top_call_st["top_call_bid_st"] = a_bid_st
+        if a_ask_st is not None: top_call_st["top_call_ask_st"] = a_ask_st
 
         # ✅ 근월물 콜 매수/매도 주도 근사 (Alpaca bid/ask, 무료 indicative feed)
         #    exp_key_st를 넘겨서 위 call_vol_st/call_oi_st와 '같은 만기'만 봄
@@ -990,10 +1154,21 @@ def collect_data(symbol: str):
             "call_vol":       call_vol,   # ✅ 추가 (콜 급등 감지에 필요)
             "put_vol":        put_vol,    # ✅ 추가
             "call_oi_st":     call_oi_st,     # ✅ 근월물(0~21일) 콜 OI
+            "put_oi_st":      put_oi_st,      # ✅ [추가 1] 근월물 풋 OI (콜/풋 동시증가=변동성 베팅 구분용)
             "call_vol_st":    call_vol_st,    # ✅ 근월물 콜 거래량
             "put_vol_st":     put_vol_st,     # ✅ 근월물 풋 거래량
             "pcr_vol_st":     pcr_vol_st,     # ✅ 근월물 PCR(거래량 기준)
+            "call_prem_st":   call_prem_st,   # ✅ [추가 2] 근월물 콜 프리미엄 거래대금($)
+            "otm_call_share_st": otm_call_share_st,  # ✅ [추가 3] 근월물 OTM 콜 비중
+            "call_prem":      call_prem,      # ✅ [추가 2] 월물 콜 프리미엄 거래대금($)
+            "otm_call_share": otm_call_share, # ✅ [추가 3] 월물 OTM 콜 비중
+            "short_pct_float": short_pct,     # ✅ [추가 5] 공매도 잔량(유통주식 대비, 격주 갱신)
+            "market_cap":     market_cap,     # ✅ [추가 5] 시가총액
+            "sector":         sector,         # ✅ [추가 5] 섹터
+            "days_to_exdiv":  days_to_exdiv,  # ✅ [추가 6] 배당락까지 남은 일수
             "exp_st":         exp_st,         # ✅ 근월물 만기일 (OI 전일比 비교 시 동일 만기 확인용)
+            **top_call,                       # ✅ 월물 최다 거래 콜: strike/bid/ask/last/volume
+            **top_call_st,                    # ✅ 근월물 최다 거래 콜: strike/bid/ask/last/volume
             "call_buy_ratio_st":    flow_st["call_buy_ratio_st"],    # ✅ 매수주도 비율(근사, 계약수 기준)
             "call_buy_notional_ratio_st": flow_st["call_buy_notional_ratio_st"],  # ✅ 금액 기준 매수비율
             "call_buy_cnt_st":      flow_st["call_buy_cnt_st"],
@@ -1288,7 +1463,13 @@ IV_COL_ORDER = [
     "gex", "gex_call", "gex_put", "dex",
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "call_vol", "put_vol",   # ✅ 추가
-    "call_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st", "exp_st",  # ✅ exp_st 추가
+    "call_prem", "otm_call_share",             # ✅ [추가 2·3] 월물 프리미엄·OTM 비중
+    "top_call_strike", "top_call_bid", "top_call_ask", "top_call_last", "top_call_volume",  # ✅ 복원(월물)
+    "call_oi_st", "put_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st", "exp_st",  # ✅ [추가 1] put_oi_st
+    "call_prem_st", "otm_call_share_st",       # ✅ [추가 2·3] 근월물 프리미엄·OTM 비중
+    "iv_rank",                                  # ✅ [추가 4] IV 백분위(자기 과거 대비, 표본 부족 시 None)
+    "short_pct_float", "market_cap", "sector", "days_to_exdiv",  # ✅ [추가 5·6]
+    "top_call_strike_st", "top_call_bid_st", "top_call_ask_st", "top_call_last_st", "top_call_volume_st",  # ✅ 근월물
     "call_buy_ratio_st", "call_buy_notional_ratio_st", "call_buy_cnt_st", "call_sell_cnt_st",  # ✅ 매수주도 근사
     "call_checked_cnt_st", "call_no_quote_cnt_st", "call_buy_notional_st",
     "call_avg_bid_st", "call_avg_ask_st", "call_avg_spread_pct_st",    # ✅ 실제 bid/ask 값
@@ -1433,10 +1614,38 @@ def check_market_data_quality(market_row: dict) -> list:
 # ====================================================
 # ✅ 콜 거래량 급등 감지
 # ====================================================
+# ✅ [업그레이드] 콜 급등 '신호의 질' 채점 기준
+SURGE_PREM_MIN = 1_000_000   # 콜 프리미엄 거래대금 $1M 이상 = 돈이 실린 급증
+SURGE_OTM_MIN  = 0.50        # OTM 콜 비중 50% 이상 = 방향성 베팅 성격
+SURGE_PCR_MAX  = 0.70        # 풋/콜 거래량 비율 0.7 이하 = 콜 단독(풋 동반 아님)
+
+def format_top_call(strike, bid, ask, last, volume, exp=None) -> str:
+    """✅ 알림용 최다 거래 콜 행사가 표시 문자열.
+    yfinance bid/ask는 장마감 후 0으로 지워질 수 있어 그 경우 마지막 체결가로 대체."""
+    if strike is None:
+        return "주력행사가=N/A"
+    s = f"주력행사가 ${strike:g}"
+    if exp:
+        s += f"({exp})"
+    if volume:
+        s += f" 거래량={volume:,}"
+    if bid is not None and ask is not None:
+        s += f" bid={bid:.2f}/ask={ask:.2f}"
+    elif last is not None:
+        s += f" 체결가={last:.2f} (bid/ask 마감소멸)"
+    else:
+        s += " bid/ask=N/A"
+    return s
+
+
 def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol: int = 500) -> list:
     """
     call_vol / call_oi >= threshold 이고 call_vol >= min_call_vol 인 종목 탐지.
-    비율 높은 순으로 정렬하여 반환.
+    ✅ [업그레이드] 1차 필터 통과 후 신규 지표로 '신호의 질'을 채점해 선별:
+      💰 프리미엄: 콜 거래대금 >= SURGE_PREM_MIN → 로또콜 아닌 '돈이 실린' 급증
+      🎯 OTM집중: OTM 콜 비중 >= SURGE_OTM_MIN → 헤지가 아닌 방향성 베팅
+      📉 콜단독: 풋 거래 동반이 적음(PCR<=기준) → 변동성 베팅/헤지 아님
+    3개 중 2개 이상이면 ⭐핵심 후보. 점수 → 비율 순으로 정렬.
     """
     surges = []
     for row in results:
@@ -1453,15 +1662,41 @@ def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol
         if ratio < vol_oi_threshold:
             continue
 
+        # ✅ 신호의 질 채점 (1~3번 신규 지표 활용)
+        call_prem = row.get("call_prem")
+        otm_share = row.get("otm_call_share")
+        flags = []
+        if call_prem is not None and call_prem >= SURGE_PREM_MIN:
+            flags.append("💰돈실림")
+        if otm_share is not None and otm_share >= SURGE_OTM_MIN:
+            flags.append("🎯OTM집중")
+        if pcr_vol is not None and pcr_vol <= SURGE_PCR_MAX:
+            flags.append("📉콜단독")
+        score = len(flags)
+
         surges.append({
-            "symbol":   row["symbol"],
-            "call_vol": int(call_vol),
-            "call_oi":  int(call_oi),
-            "ratio":    round(ratio, 2),
-            "pcr_vol":  pcr_vol,
+            "symbol":    row["symbol"],
+            "call_vol":  int(call_vol),
+            "call_oi":   int(call_oi),
+            "ratio":     round(ratio, 2),
+            "pcr_vol":   pcr_vol,
+            "score":     score,
+            "flags":     flags,
+            "call_prem": call_prem,
+            "otm_share": otm_share,
+            "iv_rank":   row.get("iv_rank"),
+            "short_pct": row.get("short_pct_float"),
+            "days_to_earn": row.get("days_to_earn"),
+            # ✅ 최다 거래 콜 행사가 정보 (bid/ask 표시 복원)
+            "top_strike": row.get("top_call_strike"),
+            "top_bid":    row.get("top_call_bid"),
+            "top_ask":    row.get("top_call_ask"),
+            "top_last":   row.get("top_call_last"),
+            "top_volume": row.get("top_call_volume"),
         })
 
-    surges.sort(key=lambda x: x["ratio"], reverse=True)
+    # ✅ 신호의 질(점수) 우선, 같은 점수면 거래량/OI 비율 순
+    surges.sort(key=lambda x: (x["score"], x["ratio"]), reverse=True)
     return surges
 
 
@@ -1517,6 +1752,13 @@ def detect_buyside_call_surge(results: list, vol_oi_threshold: float = 1.5,
             "avg_bid":      avg_bid,
             "avg_ask":      avg_ask,
             "avg_spread":   avg_spread,
+            # ✅ [수정] 근월물 주력행사가 bid/ask도 알림에 표시
+            "top_strike":   row.get("top_call_strike_st"),
+            "top_bid":      row.get("top_call_bid_st"),
+            "top_ask":      row.get("top_call_ask_st"),
+            "top_last":     row.get("top_call_last_st"),
+            "top_volume":   row.get("top_call_volume_st"),
+            "exp_st":       row.get("exp_st"),
         })
 
     # 매수주도 비율 우선, 그다음 거래량/OI 비율 순
@@ -1545,8 +1787,10 @@ OI_CHANGE_THRESHOLD = 1.5   # 전일 대비 1.5배 이상
 OI_CHANGE_MIN_ABS   = 500   # 최소 절대 증가 계약수
 
 def load_history_csv():
-    """지금까지 축적된 iv_data CSV 전체 로드 (반기 파일 경계 자동 처리, 오늘 제외)"""
-    need_cols = {"date", "symbol", "call_vol_st", "call_oi_st", "exp_st"}
+    """지금까지 축적된 iv_data CSV 전체 로드 (반기 파일 경계 자동 처리, 오늘 제외)
+    ✅ iv_data_*_H*.csv 패턴으로 H1/H2, 연도가 바뀌어 파일이 몇 개로 나뉘어도
+       전부 읽어 이어붙이므로 IV Rank·상대거래량 계산이 파일 경계에서 끊기지 않음"""
+    need_cols = {"date", "symbol", "call_vol_st", "call_oi_st", "exp_st", "avg_iv"}
     frames = []
     for fp in sorted(glob.glob("iv_data_*_H*.csv")):
         try:
@@ -1558,6 +1802,36 @@ def load_history_csv():
     hist = pd.concat(frames, ignore_index=True)
     hist = hist[hist["date"] < today]   # 오늘 저장분 제외
     return hist if not hist.empty else None
+
+
+# ====================================================
+# ✅ [추가 4] IV Rank (IV 백분위)
+#    오늘의 avg_iv가 그 종목 자신의 과거 분포에서 몇 %ile인지.
+#    avg_iv=0.45가 "높은지 낮은지"는 종목마다 다르므로 자기 과거와 비교.
+#    표본 IV_RANK_MIN_DAYS(40거래일≈2개월) 미만이면 None → 데이터가
+#    쌓이면 자동으로 켜짐. 최대 252거래일(1년) 윈도우 사용.
+# ====================================================
+IV_RANK_MIN_DAYS = 40
+IV_RANK_WINDOW   = 252
+
+def add_iv_rank(results: list, hist_df):
+    filled = 0
+    if hist_df is None or hist_df.empty or "avg_iv" not in hist_df.columns:
+        for row in results:
+            row["iv_rank"] = None
+        return 0
+    grouped = {sym: g for sym, g in hist_df.groupby("symbol")}
+    for row in results:
+        row["iv_rank"] = None
+        cur_iv = row.get("avg_iv")
+        h = grouped.get(row["symbol"])
+        if cur_iv is None or h is None:
+            continue
+        past = h.sort_values("date")["avg_iv"].dropna().tail(IV_RANK_WINDOW)
+        if len(past) >= IV_RANK_MIN_DAYS:
+            row["iv_rank"] = round(float((past < cur_iv).mean() * 100), 1)
+            filled += 1
+    return filled
 
 
 def detect_unusual_activity(results: list, hist_df):
@@ -1588,6 +1862,13 @@ def detect_unusual_activity(results: list, hist_df):
                         "ratio":    round(cv / avg, 1),
                         "days":     len(past),
                         "pcr":      row.get("pcr_vol_st"),
+                        # ✅ [수정] 주력행사가 bid/ask 알림 표시용
+                        "top_strike": row.get("top_call_strike_st"),
+                        "top_bid":    row.get("top_call_bid_st"),
+                        "top_ask":    row.get("top_call_ask_st"),
+                        "top_last":   row.get("top_call_last_st"),
+                        "top_volume": row.get("top_call_volume_st"),
+                        "exp_st":     row.get("exp_st"),
                     })
 
         # (b) OI 급증 (전일 매집 확인) — 같은 만기끼리만 비교
@@ -1609,6 +1890,12 @@ def detect_unusual_activity(results: list, hist_df):
                         "prev_date": prev_date,
                         "ratio":     round(oi / prev_oi, 1),
                         "exp":       exp_st,
+                        # ✅ [수정] 주력행사가 bid/ask 알림 표시용
+                        "top_strike": row.get("top_call_strike_st"),
+                        "top_bid":    row.get("top_call_bid_st"),
+                        "top_ask":    row.get("top_call_ask_st"),
+                        "top_last":   row.get("top_call_last_st"),
+                        "top_volume": row.get("top_call_volume_st"),
                     })
 
     rel_surges.sort(key=lambda x: x["ratio"], reverse=True)
@@ -1748,7 +2035,17 @@ if failed_details:
         )
 
 if results:
+    # ✅ [추가 4] 저장 전에 축적 히스토리를 로드해 IV Rank 부여
+    #    (분할된 모든 iv_data_*_H*.csv를 읽으므로 파일 경계 무관)
+    hist_df = load_history_csv()
+    iv_rank_cnt = add_iv_rank(results, hist_df)
+    if iv_rank_cnt:
+        print(f"  📐 IV Rank 계산 완료: {iv_rank_cnt}개 종목 (표본 {IV_RANK_MIN_DAYS}일 이상)")
+    else:
+        print(f"  📐 IV Rank: 표본 부족(종목당 {IV_RANK_MIN_DAYS}거래일 필요) → 데이터가 쌓이면 자동 활성화")
     save_csv(results, IV_COL_ORDER, "iv_data")
+else:
+    hist_df = None
 
 if failed:
     with open("failed_symbols.txt", "w") as f:
@@ -1837,18 +2134,49 @@ send_telegram(msg)
 if results:
     call_surges = detect_call_surge(results)
     if call_surges:
-        lines = [f"🚀 <b>콜 거래량 급등 감지</b> — {today}\n"]
-        for s in call_surges[:15]:
+        core  = [s for s in call_surges if s["score"] >= 2]   # ⭐ 핵심 후보 (3개 기준 중 2개+)
+        other = [s for s in call_surges if s["score"] < 2]
+
+        def _surge_line(s, star=False):
             pcr_str = f"PCR={s['pcr_vol']:.2f}" if s["pcr_vol"] else "PCR=N/A"
-            lines.append(
-                f"• <b>{s['symbol']}</b>  "
+            prem_str = (f"대금=${s['call_prem']/1e6:.1f}M" if s["call_prem"] is not None
+                        else "대금=N/A")
+            otm_str = (f"OTM={s['otm_share']*100:.0f}%" if s["otm_share"] is not None
+                       else "OTM=N/A")
+            ivr_str = f"IVR={s['iv_rank']:.0f}" if s["iv_rank"] is not None else "IVR=수집중"
+            extra = []
+            if s["short_pct"] is not None and s["short_pct"] >= 0.10:
+                extra.append(f"⚡공매도{s['short_pct']*100:.0f}%")   # 스퀴즈 후보 참고
+            if s["days_to_earn"] is not None and 0 <= s["days_to_earn"] <= 7:
+                extra.append(f"📅어닝D-{s['days_to_earn']}")          # 어닝 노이즈 주의 표시
+            flag_str = " ".join(s["flags"] + extra)
+            top_str = format_top_call(s.get("top_strike"), s.get("top_bid"),
+                                      s.get("top_ask"), s.get("top_last"),
+                                      s.get("top_volume"))
+            head = "⭐ " if star else "• "
+            return (
+                f"{head}<b>{s['symbol']}</b>  "
                 f"콜거래량={s['call_vol']:,}  OI={s['call_oi']:,}  "
-                f"비율={s['ratio']}x  {pcr_str}"
+                f"비율={s['ratio']}x  {pcr_str}\n"
+                f"  └ {prem_str}  {otm_str}  {ivr_str}  {flag_str}\n"
+                f"  └ {top_str}"
             )
-        if len(call_surges) > 15:
-            lines.append(f"... 외 {len(call_surges)-15}개")
+
+        lines = [f"🚀 <b>콜 거래량 급등 감지</b> — {today}",
+                 f"(⭐=핵심 후보: 💰대금 $1M+ / 🎯OTM 50%+ / 📉콜단독 중 2개 이상 충족)\n"]
+        if core:
+            lines.append(f"<b>⭐ 핵심 후보 {len(core)}개</b>")
+            for s in core[:10]:
+                lines.append(_surge_line(s, star=True))
+            lines.append("")
+        if other:
+            lines.append(f"참고 후보 {len(other)}개")
+            for s in other[:8]:
+                lines.append(_surge_line(s))
+            if len(other) > 8:
+                lines.append(f"... 외 {len(other)-8}개")
         send_telegram("\n".join(lines))
-        print(f"  📡 콜 급등 감지 {len(call_surges)}개 전송 완료")
+        print(f"  📡 콜 급등 감지 전송 완료 (핵심 {len(core)} / 참고 {len(other)})")
     else:
         print("  ℹ️ 콜 거래량 급등 종목 없음")
 
@@ -1859,19 +2187,23 @@ if results:
                  f"(근월물 최근접 만기 · bid/ask 근사 · 참고용 지표)\n"]
         for s in buyside_surges[:15]:
             pcr_str    = f"PCR={s['pcr_vol_st']:.2f}" if s["pcr_vol_st"] else "PCR=N/A"
-            bidask_str = (f"bid={s['avg_bid']:.2f}/ask={s['avg_ask']:.2f}"
+            bidask_str = (f"평균bid={s['avg_bid']:.2f}/ask={s['avg_ask']:.2f}"
                           f"(스프레드{s['avg_spread']}%)"
                           if s["avg_bid"] is not None and s["avg_ask"] is not None
-                          else "bid/ask=N/A")
+                          else "평균bid/ask=N/A(Alpaca quote 부재)")
             notional_str = (f"금액기준={s['buy_ratio_notional']*100:.0f}%"
                              if s["buy_ratio_notional"] is not None else "금액기준=N/A")
+            top_str = format_top_call(s.get("top_strike"), s.get("top_bid"),
+                                      s.get("top_ask"), s.get("top_last"),
+                                      s.get("top_volume"), exp=s.get("exp_st"))
             lines.append(
                 f"• <b>{s['symbol']}</b>  "
                 f"매수비율={s['buy_ratio']*100:.0f}% ({notional_str}) "
                 f"(매수{s['buy_cnt']}/매도{s['sell_cnt']})  "
                 f"콜거래량={s['call_vol_st']:,}  OI={s['call_oi_st']:,}  "
                 f"비율={s['ratio']}x  {pcr_str}\n"
-                f"  {bidask_str}"
+                f"  └ {top_str}\n"       # ✅ [수정] 근월물 주력행사가 bid/ask 표시
+                f"  └ {bidask_str}"
             )
         if len(buyside_surges) > 15:
             lines.append(f"... 외 {len(buyside_surges)-15}개")
@@ -1891,8 +2223,8 @@ if results:
 
     # ====================================================
     # ✅ [개선] 축적 데이터 기반 이례성 감지 (상대 거래량 + OI 급증)
+    #    (hist_df는 저장 전 IV Rank 계산 때 이미 로드됨 → 재사용)
     # ====================================================
-    hist_df = load_history_csv()
     rel_surges, oi_surges = detect_unusual_activity(results, hist_df)
 
     if rel_surges:
@@ -1900,10 +2232,14 @@ if results:
                  f"(자기 자신의 최근 {REL_VOL_LOOKBACK}일 평균과 비교)\n"]
         for s in rel_surges[:15]:
             pcr_str = f"PCR={s['pcr']:.2f}" if s["pcr"] is not None else "PCR=N/A"
+            top_str = format_top_call(s.get("top_strike"), s.get("top_bid"),
+                                      s.get("top_ask"), s.get("top_last"),
+                                      s.get("top_volume"), exp=s.get("exp_st"))
             lines.append(
                 f"• <b>{s['symbol']}</b>  "
                 f"오늘={s['call_vol']:,}  평소={s['avg_vol']:,}  "
-                f"<b>{s['ratio']}배</b>  {pcr_str} (표본 {s['days']}일)"
+                f"<b>{s['ratio']}배</b>  {pcr_str} (표본 {s['days']}일)\n"
+                f"  └ {top_str}"   # ✅ [수정] 주력행사가 bid/ask 표시
             )
         if len(rel_surges) > 15:
             lines.append(f"... 외 {len(rel_surges)-15}개")
@@ -1916,10 +2252,14 @@ if results:
         lines = [f"🧲 <b>근월물 콜 OI 급증 감지</b> — {today}",
                  f"(전 거래일 대비, 동일 만기 기준 — 전일 세션의 신규 포지션 개설 확증)\n"]
         for s in oi_surges[:15]:
+            top_str = format_top_call(s.get("top_strike"), s.get("top_bid"),
+                                      s.get("top_ask"), s.get("top_last"),
+                                      s.get("top_volume"))
             lines.append(
                 f"• <b>{s['symbol']}</b>  "
                 f"OI {s['prev_oi']:,} → {s['oi']:,} (<b>{s['ratio']}배</b>)  "
-                f"만기={s['exp']} (기준일 {s['prev_date']})"
+                f"만기={s['exp']} (기준일 {s['prev_date']})\n"
+                f"  └ {top_str}"   # ✅ [수정] 주력행사가 bid/ask 표시
             )
         if len(oi_surges) > 15:
             lines.append(f"... 외 {len(oi_surges)-15}개")
