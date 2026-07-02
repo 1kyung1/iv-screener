@@ -1,33 +1,28 @@
 name: IV Collector
-
 on:
   schedule:
-    - cron: "0 23 * * *"
+    - cron: "0 23 * * 1-5"   # ✅ UTC 월~금 = 미국 장 운영일만 실행 (한국 체감: 화~토 아침)
   workflow_dispatch:
-
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 150      # ✅ yfinance 등 멈춤 시 기본 6시간 낭비 방지
     permissions:
       contents: write
-
     steps:
       - name: 코드 가져오기
         uses: actions/checkout@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-
       - name: Python 설치
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-
       - name: 라이브러리 설치
         run: |
           pip install --upgrade pip
           pip install --upgrade pandas requests alpaca-py html5lib yfinance exchange_calendars
-
       - name: Python 실행
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -35,7 +30,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python iv_collector.py
-
       - name: CSV 저장 & 푸시
         run: |
           git config user.name "github-actions"
