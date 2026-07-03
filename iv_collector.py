@@ -482,6 +482,26 @@ def _strike_zone_shares(calls, cur_price, call_vol):
     return otm_share, otm_near_share, itm_share
 
 
+def _strike_concentration(calls):
+    """
+    ✅ [추가] 행사가 집중도 (허핀달 지수, 0~1)
+    콜 거래량이 특정 행사가에 얼마나 몰려있는지.
+    - 1에 가까움 = 한두 행사가에 집중 (특정 시나리오에 베팅하는 정보성 매수 특징)
+    - 0에 가까움 = 여러 행사가에 분산 (개미 물량/일반 거래 특징)
+    ※ 상장 행사가 수가 적은 종목은 자연히 높게 나오므로 절대값보다
+      자기 과거 대비·종목 간 상대 비교로 사용할 것 (백테스트에서 검증 후 알림 승격 예정)
+    """
+    try:
+        vol   = calls["volume"].fillna(0)
+        total = float(vol.sum())
+        if total <= 0:
+            return None
+        shares = vol / total
+        return round(float((shares ** 2).sum()), 4)
+    except Exception:
+        return None
+
+
 def calc_oi_metrics(yf_ticker, cur_price=None):
     try:
         exps = yf_ticker.options
@@ -583,6 +603,7 @@ def calc_oi_metrics(yf_ticker, cur_price=None):
             "otm_call_share": otm_share,      # 전체 OTM 비중 (백테스트 비교용 유지)
             "otm_near_share": otm_near_share, # ✅ [조언 3] +0~15% 근접 OTM 비중
             "itm_call_share": itm_share,      # ✅ [조언 2] ITM 비중
+            "strike_conc":    _strike_concentration(calls),  # ✅ 행사가 집중도(HHI)
             "oi_exp":     str(target_exp),    # ✅ [조언 4] 월물 만기일 (알림 표시용)
             "oi_exp_dte": oi_dte,   # ✅ 어떤 만기(DTE)를 사용했는지 기록 (폴백 추적용)
             "oi_exp_key": pd.Timestamp(target_exp).strftime("%y%m%d"),  # ✅ Alpaca 심볼 매칭용 만기 키
@@ -671,6 +692,7 @@ def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_d
             "otm_call_share_st": otm_share,            # 전체 OTM 비중 (백테스트 비교용 유지)
             "otm_near_share_st": otm_near_share,       # ✅ [조언 3] +0~15% 근접 OTM 비중
             "itm_call_share_st": itm_share,            # ✅ [조언 2] ITM 비중
+            "strike_conc_st": _strike_concentration(calls),  # ✅ 행사가 집중도(HHI)
             "target_exp_st": target_exp,
             "exp_key_st":   exp_key,
             "dte_st":       target_dte,
@@ -976,6 +998,7 @@ def collect_data(symbol: str):
         otm_call_share = oi_m.get("otm_call_share") if oi_m else None   # ✅ [추가 3]
         otm_near_share = oi_m.get("otm_near_share") if oi_m else None   # ✅ [조언 3]
         itm_call_share = oi_m.get("itm_call_share") if oi_m else None   # ✅ [조언 2]
+        strike_conc    = oi_m.get("strike_conc")    if oi_m else None   # ✅ 행사가 집중도
         oi_exp         = oi_m.get("oi_exp")         if oi_m else None   # ✅ [조언 4]
         # ✅ 최다 거래 콜 행사가 정보 (월물)
         top_call = {k: (oi_m.get(k) if oi_m else None)
@@ -993,6 +1016,7 @@ def collect_data(symbol: str):
         otm_call_share_st = oi_st.get("otm_call_share_st") if oi_st else None   # ✅ [추가 3]
         otm_near_share_st = oi_st.get("otm_near_share_st") if oi_st else None   # ✅ [조언 3]
         itm_call_share_st = oi_st.get("itm_call_share_st") if oi_st else None   # ✅ [조언 2]
+        strike_conc_st    = oi_st.get("strike_conc_st")    if oi_st else None   # ✅ 행사가 집중도
         exp_key_st  = oi_st["exp_key_st"]  if oi_st else None
         exp_st      = oi_st["target_exp_st"] if oi_st else None  # ✅ OI 전일比 비교 시 같은 만기인지 확인용
         # ✅ 최다 거래 콜 행사가 정보 (근월물)
@@ -1185,10 +1209,12 @@ def collect_data(symbol: str):
             "otm_call_share_st": otm_call_share_st,  # ✅ [추가 3] 근월물 OTM 콜 비중
             "otm_near_share_st": otm_near_share_st,  # ✅ [조언 3] 근월물 +0~15% 근접OTM 비중
             "itm_call_share_st": itm_call_share_st,  # ✅ [조언 2] 근월물 ITM 비중
+            "strike_conc_st": strike_conc_st,        # ✅ 근월물 행사가 집중도(HHI)
             "call_prem":      call_prem,      # ✅ [추가 2] 월물 콜 프리미엄 거래대금($)
             "otm_call_share": otm_call_share, # ✅ [추가 3] 월물 OTM 콜 비중
             "otm_near_share": otm_near_share, # ✅ [조언 3] 월물 +0~15% 근접OTM 비중
             "itm_call_share": itm_call_share, # ✅ [조언 2] 월물 ITM 비중
+            "strike_conc":    strike_conc,    # ✅ 월물 행사가 집중도(HHI)
             "oi_exp":         oi_exp,         # ✅ [조언 4] 월물 만기일
             "short_pct_float": short_pct,     # ✅ [추가 5] 공매도 잔량(유통주식 대비, 격주 갱신)
             "market_cap":     market_cap,     # ✅ [추가 5] 시가총액
@@ -1493,10 +1519,12 @@ IV_COL_ORDER = [
     "call_vol", "put_vol",   # ✅ 추가
     "call_prem", "otm_call_share",             # ✅ [추가 2·3] 월물 프리미엄·OTM 비중
     "otm_near_share", "itm_call_share", "oi_exp",   # ✅ [조언 2·3·4] 근접OTM·ITM 비중·월물 만기
+    "strike_conc",                              # ✅ 월물 행사가 집중도(HHI)
     "top_call_strike", "top_call_bid", "top_call_ask", "top_call_last", "top_call_volume",  # ✅ 복원(월물)
     "call_oi_st", "put_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st", "exp_st",  # ✅ [추가 1] put_oi_st
     "call_prem_st", "otm_call_share_st",       # ✅ [추가 2·3] 근월물 프리미엄·OTM 비중
     "otm_near_share_st", "itm_call_share_st",  # ✅ [조언 2·3] 근월물 근접OTM·ITM 비중
+    "strike_conc_st",                          # ✅ 근월물 행사가 집중도(HHI)
     "iv_rank",                                  # ✅ [추가 4] IV 백분위(자기 과거 대비, 표본 부족 시 None)
     "short_pct_float", "market_cap", "sector", "days_to_exdiv",  # ✅ [추가 5·6]
     "top_call_strike_st", "top_call_bid_st", "top_call_ask_st", "top_call_last_st", "top_call_volume_st",  # ✅ 근월물
