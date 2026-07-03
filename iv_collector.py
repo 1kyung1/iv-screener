@@ -460,6 +460,28 @@ def _top_call_info(calls):
         return {}
 
 
+OTM_NEAR_BAND = 0.15   # ✅ [조언 3] 근접 OTM 밴드: 현재가 +0~15% 구간만 '방향성 베팅'으로 인정
+
+def _strike_zone_shares(calls, cur_price, call_vol):
+    """
+    ✅ [조언 2·3 반영] 콜 거래량의 행사가 구간별 비중 계산
+      - otm_share:      현재가 초과 전체 (기존 지표, 백테스트 비교용으로 유지)
+      - otm_near_share: 현재가 +0~15% 구간만 (딥OTM 로또콜 노이즈 제거 → 방향성 베팅 순도↑)
+      - itm_share:      현재가 이하 (깊은 ITM 대량 매수 = 주식 대용의 강한 확신 신호 가능)
+    """
+    otm_share, otm_near_share, itm_share = None, None, None
+    try:
+        if cur_price and call_vol > 0:
+            vol = calls["volume"].fillna(0)
+            otm_share      = round(float(vol[calls["strike"] > cur_price].sum()) / call_vol, 4)
+            near_mask      = (calls["strike"] > cur_price) & (calls["strike"] <= cur_price * (1 + OTM_NEAR_BAND) + 1e-6)
+            otm_near_share = round(float(vol[near_mask].sum()) / call_vol, 4)
+            itm_share      = round(float(vol[calls["strike"] <= cur_price].sum()) / call_vol, 4)
+    except Exception:
+        pass
+    return otm_share, otm_near_share, itm_share
+
+
 def calc_oi_metrics(yf_ticker, cur_price=None):
     try:
         exps = yf_ticker.options
@@ -544,19 +566,13 @@ def calc_oi_metrics(yf_ticker, cur_price=None):
 
         top = _top_call_info(calls)   # ✅ 최다 거래 콜 행사가 정보 (알림 표시용)
 
-        # ✅ [추가 2·3] 월물 콜 프리미엄 거래대금($) + OTM 콜 집중도
+        # ✅ [추가 2·3 + 조언 2·3] 월물 콜 프리미엄 거래대금($) + 행사가 구간별 비중
         call_prem = None
         try:
             call_prem = int((calls["volume"].fillna(0) * calls["lastPrice"].fillna(0)).sum() * 100)
         except Exception:
             pass
-        otm_share = None
-        try:
-            if cur_price and call_vol > 0:
-                otm_vol   = calls.loc[calls["strike"] > cur_price, "volume"].fillna(0).sum()
-                otm_share = round(float(otm_vol) / call_vol, 4)
-        except Exception:
-            pass
+        otm_share, otm_near_share, itm_share = _strike_zone_shares(calls, cur_price, call_vol)
 
         return {
             "call_oi":  call_oi, "put_oi":   put_oi,
@@ -564,7 +580,10 @@ def calc_oi_metrics(yf_ticker, cur_price=None):
             "pcr_oi":   pcr_oi,  "pcr_vol":  pcr_vol,
             "max_pain": max_pain,
             "call_prem": call_prem,           # ✅ [추가 2] 월물 콜 프리미엄 거래대금($)
-            "otm_call_share": otm_share,      # ✅ [추가 3] 월물 OTM 콜 거래량 비중(0~1)
+            "otm_call_share": otm_share,      # 전체 OTM 비중 (백테스트 비교용 유지)
+            "otm_near_share": otm_near_share, # ✅ [조언 3] +0~15% 근접 OTM 비중
+            "itm_call_share": itm_share,      # ✅ [조언 2] ITM 비중
+            "oi_exp":     str(target_exp),    # ✅ [조언 4] 월물 만기일 (알림 표시용)
             "oi_exp_dte": oi_dte,   # ✅ 어떤 만기(DTE)를 사용했는지 기록 (폴백 추적용)
             "oi_exp_key": pd.Timestamp(target_exp).strftime("%y%m%d"),  # ✅ Alpaca 심볼 매칭용 만기 키
             "top_call_strike": top.get("strike"),
@@ -583,8 +602,13 @@ def calc_oi_metrics(yf_ticker, cur_price=None):
 #    (기존 calc_oi_metrics는 30~45일 만기 "하나"만 보므로
 #     뉴스 선반영 성격의 근월물 콜 급등은 잡지 못함)
 # ====================================================
-NEAR_TERM_MAX_DTE = 21   # 0~21일 남은 만기를 "단기"로 간주 (필요시 조정)
-NEAR_TERM_MIN_DTE = 0
+# ✅ [조언 1 반영] 근월물 밴드: 0~21일 → 7~30일
+#    - 하한 7일: 대형주 0DTE/위클리 데이트레이딩 노이즈 제거
+#    - 상한 30일: 이벤트 대기 여유 + 세타 감당 가능한 '스위트스팟'(3~4주) 포함
+#    ※ 밴드 변경 시점 전후로 exp_st가 달라지므로 OI 전일比 비교는
+#      동일만기 조건에 의해 자동으로 안전하게 리셋됨
+NEAR_TERM_MAX_DTE = 30
+NEAR_TERM_MIN_DTE = 7
 
 def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_dte: int = NEAR_TERM_MAX_DTE,
                               cur_price=None):
@@ -634,16 +658,8 @@ def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_d
         except Exception:
             pass
 
-        # ✅ [추가 3] OTM 콜 집중도: 현재가보다 높은 행사가의 콜 거래량 비중
-        #    인텔류 패턴의 특징인 "단기 + 외가격 콜 집중"(방향성 베팅)과
-        #    ATM 중심 헤지성 거래를 구분. cur_price 없으면 None
-        otm_share = None
-        try:
-            if cur_price and call_vol > 0:
-                otm_vol   = calls.loc[calls["strike"] > cur_price, "volume"].fillna(0).sum()
-                otm_share = round(float(otm_vol) / call_vol, 4)
-        except Exception:
-            pass
+        # ✅ [추가 3 + 조언 2·3] 행사가 구간별 콜 거래량 비중
+        otm_share, otm_near_share, itm_share = _strike_zone_shares(calls, cur_price, call_vol)
 
         return {
             "call_oi_st":   call_oi,
@@ -652,7 +668,9 @@ def calc_near_term_oi_metrics(yf_ticker, min_dte: int = NEAR_TERM_MIN_DTE, max_d
             "put_vol_st":   put_vol,
             "pcr_vol_st":   pcr_vol,
             "call_prem_st": call_prem,   # ✅ [추가 2] 근월물 콜 프리미엄 거래대금($)
-            "otm_call_share_st": otm_share,  # ✅ [추가 3] 근월물 OTM 콜 거래량 비중(0~1)
+            "otm_call_share_st": otm_share,            # 전체 OTM 비중 (백테스트 비교용 유지)
+            "otm_near_share_st": otm_near_share,       # ✅ [조언 3] +0~15% 근접 OTM 비중
+            "itm_call_share_st": itm_share,            # ✅ [조언 2] ITM 비중
             "target_exp_st": target_exp,
             "exp_key_st":   exp_key,
             "dte_st":       target_dte,
@@ -956,6 +974,9 @@ def collect_data(symbol: str):
         oi_exp_dte = oi_m.get("oi_exp_dte") if oi_m else None
         call_prem      = oi_m.get("call_prem")      if oi_m else None   # ✅ [추가 2]
         otm_call_share = oi_m.get("otm_call_share") if oi_m else None   # ✅ [추가 3]
+        otm_near_share = oi_m.get("otm_near_share") if oi_m else None   # ✅ [조언 3]
+        itm_call_share = oi_m.get("itm_call_share") if oi_m else None   # ✅ [조언 2]
+        oi_exp         = oi_m.get("oi_exp")         if oi_m else None   # ✅ [조언 4]
         # ✅ 최다 거래 콜 행사가 정보 (월물)
         top_call = {k: (oi_m.get(k) if oi_m else None)
                     for k in ("top_call_strike", "top_call_bid", "top_call_ask",
@@ -970,6 +991,8 @@ def collect_data(symbol: str):
         pcr_vol_st  = oi_st["pcr_vol_st"]  if oi_st else None
         call_prem_st      = oi_st.get("call_prem_st")      if oi_st else None   # ✅ [추가 2]
         otm_call_share_st = oi_st.get("otm_call_share_st") if oi_st else None   # ✅ [추가 3]
+        otm_near_share_st = oi_st.get("otm_near_share_st") if oi_st else None   # ✅ [조언 3]
+        itm_call_share_st = oi_st.get("itm_call_share_st") if oi_st else None   # ✅ [조언 2]
         exp_key_st  = oi_st["exp_key_st"]  if oi_st else None
         exp_st      = oi_st["target_exp_st"] if oi_st else None  # ✅ OI 전일比 비교 시 같은 만기인지 확인용
         # ✅ 최다 거래 콜 행사가 정보 (근월물)
@@ -1160,8 +1183,13 @@ def collect_data(symbol: str):
             "pcr_vol_st":     pcr_vol_st,     # ✅ 근월물 PCR(거래량 기준)
             "call_prem_st":   call_prem_st,   # ✅ [추가 2] 근월물 콜 프리미엄 거래대금($)
             "otm_call_share_st": otm_call_share_st,  # ✅ [추가 3] 근월물 OTM 콜 비중
+            "otm_near_share_st": otm_near_share_st,  # ✅ [조언 3] 근월물 +0~15% 근접OTM 비중
+            "itm_call_share_st": itm_call_share_st,  # ✅ [조언 2] 근월물 ITM 비중
             "call_prem":      call_prem,      # ✅ [추가 2] 월물 콜 프리미엄 거래대금($)
             "otm_call_share": otm_call_share, # ✅ [추가 3] 월물 OTM 콜 비중
+            "otm_near_share": otm_near_share, # ✅ [조언 3] 월물 +0~15% 근접OTM 비중
+            "itm_call_share": itm_call_share, # ✅ [조언 2] 월물 ITM 비중
+            "oi_exp":         oi_exp,         # ✅ [조언 4] 월물 만기일
             "short_pct_float": short_pct,     # ✅ [추가 5] 공매도 잔량(유통주식 대비, 격주 갱신)
             "market_cap":     market_cap,     # ✅ [추가 5] 시가총액
             "sector":         sector,         # ✅ [추가 5] 섹터
@@ -1464,9 +1492,11 @@ IV_COL_ORDER = [
     "pcr_oi", "pcr_vol", "call_oi", "put_oi",
     "call_vol", "put_vol",   # ✅ 추가
     "call_prem", "otm_call_share",             # ✅ [추가 2·3] 월물 프리미엄·OTM 비중
+    "otm_near_share", "itm_call_share", "oi_exp",   # ✅ [조언 2·3·4] 근접OTM·ITM 비중·월물 만기
     "top_call_strike", "top_call_bid", "top_call_ask", "top_call_last", "top_call_volume",  # ✅ 복원(월물)
     "call_oi_st", "put_oi_st", "call_vol_st", "put_vol_st", "pcr_vol_st", "exp_st",  # ✅ [추가 1] put_oi_st
     "call_prem_st", "otm_call_share_st",       # ✅ [추가 2·3] 근월물 프리미엄·OTM 비중
+    "otm_near_share_st", "itm_call_share_st",  # ✅ [조언 2·3] 근월물 근접OTM·ITM 비중
     "iv_rank",                                  # ✅ [추가 4] IV 백분위(자기 과거 대비, 표본 부족 시 None)
     "short_pct_float", "market_cap", "sector", "days_to_exdiv",  # ✅ [추가 5·6]
     "top_call_strike_st", "top_call_bid_st", "top_call_ask_st", "top_call_last_st", "top_call_volume_st",  # ✅ 근월물
@@ -1616,8 +1646,11 @@ def check_market_data_quality(market_row: dict) -> list:
 # ====================================================
 # ✅ [업그레이드] 콜 급등 '신호의 질' 채점 기준
 SURGE_PREM_MIN = 1_000_000   # 콜 프리미엄 거래대금 $1M 이상 = 돈이 실린 급증
-SURGE_OTM_MIN  = 0.50        # OTM 콜 비중 50% 이상 = 방향성 베팅 성격
+SURGE_OTM_MIN  = 0.40        # ✅ [조언 3] '근접 OTM(+0~15%)' 비중 40% 이상 = 방향성 베팅
+                             #    (딥OTM 로또콜은 제외하고 계산하므로 기준을 50→40%로 조정)
 SURGE_PCR_MAX  = 0.70        # 풋/콜 거래량 비율 0.7 이하 = 콜 단독(풋 동반 아님)
+SURGE_ITM_MIN  = 0.50        # ✅ [조언 2] ITM 비중 50% 이상 = 주식 대용 대량 매수 의심
+EXDIV_NOISE_DAYS = 3         # ✅ 배당락 D-3 이내의 ITM 콜 대량은 배당 캡처 노이즈로 간주
 
 def format_top_call(strike, bid, ask, last, volume, exp=None) -> str:
     """✅ 알림용 최다 거래 콜 행사가 표시 문자열.
@@ -1662,17 +1695,28 @@ def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol
         if ratio < vol_oi_threshold:
             continue
 
-        # ✅ 신호의 질 채점 (1~3번 신규 지표 활용)
-        call_prem = row.get("call_prem")
-        otm_share = row.get("otm_call_share")
+        # ✅ 신호의 질 채점 (신규 지표 + 동생분 조언 반영)
+        call_prem  = row.get("call_prem")
+        otm_near   = row.get("otm_near_share")     # ✅ [조언 3] +0~15% 근접 OTM만
+        itm_share  = row.get("itm_call_share")     # ✅ [조언 2]
+        d_exdiv    = row.get("days_to_exdiv")
         flags = []
         if call_prem is not None and call_prem >= SURGE_PREM_MIN:
             flags.append("💰돈실림")
-        if otm_share is not None and otm_share >= SURGE_OTM_MIN:
-            flags.append("🎯OTM집중")
+        if otm_near is not None and otm_near >= SURGE_OTM_MIN:
+            flags.append("🎯근접OTM")
         if pcr_vol is not None and pcr_vol <= SURGE_PCR_MAX:
             flags.append("📉콜단독")
         score = len(flags)
+
+        # ✅ [조언 2] ITM 대량 = 주식 대용의 강한 확신 매수 의심 (독립 배지)
+        #    단, 배당락 D-3 이내면 배당 캡처 차익거래 노이즈일 가능성이 높아 제외
+        itm_flag = None
+        if itm_share is not None and itm_share >= SURGE_ITM_MIN:
+            if d_exdiv is not None and d_exdiv <= EXDIV_NOISE_DAYS:
+                itm_flag = f"🏦ITM대량(배당락D-{d_exdiv} 노이즈의심)"
+            else:
+                itm_flag = "🏦ITM대량"
 
         surges.append({
             "symbol":    row["symbol"],
@@ -1682,8 +1726,11 @@ def detect_call_surge(results: list, vol_oi_threshold: float = 2.0, min_call_vol
             "pcr_vol":   pcr_vol,
             "score":     score,
             "flags":     flags,
+            "itm_flag":  itm_flag,
             "call_prem": call_prem,
-            "otm_share": otm_share,
+            "otm_near":  otm_near,
+            "itm_share": itm_share,
+            "oi_exp":    row.get("oi_exp"),        # ✅ [조언 4] 만기일 표시
             "iv_rank":   row.get("iv_rank"),
             "short_pct": row.get("short_pct_float"),
             "days_to_earn": row.get("days_to_earn"),
@@ -2141,10 +2188,13 @@ if results:
             pcr_str = f"PCR={s['pcr_vol']:.2f}" if s["pcr_vol"] else "PCR=N/A"
             prem_str = (f"대금=${s['call_prem']/1e6:.1f}M" if s["call_prem"] is not None
                         else "대금=N/A")
-            otm_str = (f"OTM={s['otm_share']*100:.0f}%" if s["otm_share"] is not None
-                       else "OTM=N/A")
+            otm_str = (f"근접OTM={s['otm_near']*100:.0f}%" if s["otm_near"] is not None
+                       else "근접OTM=N/A")
             ivr_str = f"IVR={s['iv_rank']:.0f}" if s["iv_rank"] is not None else "IVR=수집중"
+            exp_str = f"만기={s['oi_exp']}" if s.get("oi_exp") else "만기=N/A"   # ✅ [조언 4]
             extra = []
+            if s.get("itm_flag"):
+                extra.append(s["itm_flag"])                        # ✅ [조언 2] ITM대량 배지
             if s["short_pct"] is not None and s["short_pct"] >= 0.10:
                 extra.append(f"⚡공매도{s['short_pct']*100:.0f}%")   # 스퀴즈 후보 참고
             if s["days_to_earn"] is not None and 0 <= s["days_to_earn"] <= 7:
@@ -2157,13 +2207,13 @@ if results:
             return (
                 f"{head}<b>{s['symbol']}</b>  "
                 f"콜거래량={s['call_vol']:,}  OI={s['call_oi']:,}  "
-                f"비율={s['ratio']}x  {pcr_str}\n"
+                f"비율={s['ratio']}x  {pcr_str}  {exp_str}\n"
                 f"  └ {prem_str}  {otm_str}  {ivr_str}  {flag_str}\n"
                 f"  └ {top_str}"
             )
 
         lines = [f"🚀 <b>콜 거래량 급등 감지</b> — {today}",
-                 f"(⭐=핵심 후보: 💰대금 $1M+ / 🎯OTM 50%+ / 📉콜단독 중 2개 이상 충족)\n"]
+                 f"(⭐=핵심 후보: 💰대금 $1M+ / 🎯근접OTM(+0~15%) 40%+ / 📉콜단독 중 2개 이상)\n"]
         if core:
             lines.append(f"<b>⭐ 핵심 후보 {len(core)}개</b>")
             for s in core[:10]:
