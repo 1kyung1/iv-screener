@@ -1,7 +1,9 @@
 name: IV Collector
 on:
   schedule:
-    - cron: "0 23 * * 1-5"   # ✅ UTC 월~금 = 미국 장 운영일만 실행 (한국 체감: 화~토 아침)
+    - cron: "17 23 * * 1-5"   # ✅ UTC 월~금 = 미국 장 운영일만 실행 (한국 체감: 화~토 아침)
+                              # ✅ [v3.1] 정각(0분)은 전세계 워크플로우가 몰려 실행이 밀리거나
+                              #    스킵될 수 있어 어중간한 분(17분)으로 변경
   workflow_dispatch:
 jobs:
   run-script:
@@ -34,17 +36,23 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          cp iv_data_*.csv /tmp/      2>/dev/null || true
-          cp market_data_*.csv /tmp/  2>/dev/null || true
-          cp failed_symbols.txt /tmp/ 2>/dev/null || true
+          cp iv_data_*.csv /tmp/       2>/dev/null || true
+          cp market_data_*.csv /tmp/   2>/dev/null || true
+          cp failed_symbols.txt /tmp/  2>/dev/null || true
+          cp info_cache.json /tmp/     2>/dev/null || true
+          cp earnings_cache.json /tmp/ 2>/dev/null || true
           git fetch origin main
           git reset --hard origin/main
-          cp /tmp/iv_data_*.csv .      2>/dev/null || true
-          cp /tmp/market_data_*.csv .  2>/dev/null || true
-          cp /tmp/failed_symbols.txt . 2>/dev/null || true
-          git add iv_data_*.csv      || true
-          git add market_data_*.csv  || true
-          git add failed_symbols.txt || true
-          git add iv_data.csv        || true
+          cp /tmp/iv_data_*.csv .       2>/dev/null || true
+          cp /tmp/market_data_*.csv .   2>/dev/null || true
+          cp /tmp/failed_symbols.txt .  2>/dev/null || true
+          cp /tmp/info_cache.json .     2>/dev/null || true
+          cp /tmp/earnings_cache.json . 2>/dev/null || true
+          git add iv_data_*.csv       || true
+          git add market_data_*.csv   || true
+          git add failed_symbols.txt  || true
+          git add iv_data.csv         || true
+          git add info_cache.json     || true
+          git add earnings_cache.json || true
           git diff --staged --quiet || git commit -m "IV data $(date +'%Y-%m-%d')"
           git push origin main
