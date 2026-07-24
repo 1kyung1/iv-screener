@@ -1,0 +1,88 @@
+name: Backfill IV Data (일회성)
+
+# ⚠️ 수동 실행 전용. cron 없음 → 버튼을 누를 때만 돈다.
+#    Actions 탭 → "Backfill IV Data (일회성)" → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      csv_files:
+        description: '대상 파일 (비우면 iv_data_*_H*.csv 전부 자동 처리)'
+        required: false
+        default: ''
+      skip_earnings:
+        description: '실적일 보정 건너뛰기 (yfinance 호출 없이 dte_st만 추가)'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Python 설치
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 라이브러리 설치
+        run: |
+          pip install --upgrade pip
+          pip install --upgrade pandas yfinance
+
+      - name: 보정 전 상태 기록
+        run: |
+          python - << 'EOF'
+          import glob, pandas as pd
+          for f in sorted(glob.glob("iv_data_*_H*.csv")):
+              d = pd.read_csv(f)
+              neg = int((d["days_to_earn"] < 0).sum()) if "days_to_earn" in d else "-"
+              ivr = f'{d["iv_rank"].isna().mean()*100:.0f}%' if "iv_rank" in d else "-"
+              print(f"{f}: {len(d)}행 x {len(d.columns)}컬럼 | "
+                    f"days_to_earn 음수 {neg}건 | iv_rank 결측 {ivr} | "
+                    f"dte_st {'있음' if 'dte_st' in d.columns else '없음'}")
+          EOF
+
+      - name: 백필 실행
+        run: |
+          FLAG=""
+          [ "${{ inputs.skip_earnings }}" = "true" ] && FLAG="--no-earn"
+          python backfill_iv_data.py ${{ inputs.csv_files }} $FLAG
+
+      - name: 보정 후 검증
+        run: |
+          python - << 'EOF'
+          import glob, pandas as pd
+          for bak in sorted(glob.glob("iv_data_*_H*.csv.bak")):
+              f = bak[:-4]
+              a, b = pd.read_csv(bak), pd.read_csv(f)
+              print(f"\n{f}: 행 {len(a)}→{len(b)} | 컬럼 {len(a.columns)}→{len(b.columns)}")
+              assert len(a) == len(b), f"{f}: 행 수가 바뀜 — 중단"
+              if "days_to_earn" in b:
+                  print(f"  days_to_earn 음수 {int((a.days_to_earn<0).sum())} → "
+                        f"{int((b.days_to_earn<0).sum())}건")
+              print("  신규 컬럼:", [c for c in b.columns if c not in a.columns])
+              keep = [c for c in a.columns if c not in ("days_to_earn", "iv_rank")]
+              A = a.sort_values(["date","symbol"]).reset_index(drop=True)[keep]
+              B = b.sort_values(["date","symbol"]).reset_index(drop=True)[keep]
+              assert A.equals(B), f"{f}: 기존 컬럼이 변경됨 — 중단"
+              print("  ✅ 기존 컬럼 무결성 확인")
+          EOF
+
+      - name: 커밋 & 푸시
+        run: |
+          rm -f iv_data_*_H*.csv.bak   # 백업은 커밋하지 않음
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add iv_data_*_H*.csv
+          git diff --staged --quiet && echo "변경 없음" || \
+            git commit -m "Backfill: dte_st 추가 + days_to_earn/iv_rank 보정"
+          git push origin main
