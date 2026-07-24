@@ -58,6 +58,7 @@ def fetch_earnings_calendar(symbols):
     import yfinance as yf
 
     cal = {}
+    dep_fail = 0
     for i, sym in enumerate(symbols, 1):
         try:
             t = yf.Ticker(sym.replace("-", "."))
@@ -72,7 +73,16 @@ def fetch_earnings_calendar(symbols):
             if dates:
                 cal[sym] = sorted(set(dates))
         except Exception as e:
-            print(f"    [실적일 실패] {sym}: {e}")
+            msg = str(e)
+            # 환경 문제(lxml 등)는 전 종목이 똑같이 실패하므로 조기에 중단한다.
+            # v1에서는 64종목 × 동일 메시지가 로그를 뒤덮고도 원인이 안 보였다.
+            if "optional dependency" in msg or "No module named" in msg:
+                dep_fail += 1
+                if dep_fail >= 3:
+                    print(f"    ❌ 필수 패키지 누락으로 중단: {msg}")
+                    print(f"       → pip install lxml html5lib 후 재실행하십시오.")
+                    return {}
+            print(f"    [실적일 실패] {sym}: {msg}")
         if i % 50 == 0:
             print(f"    ...{i}/{len(symbols)} 종목")
     return cal
@@ -220,6 +230,12 @@ def process_one(path, do_earn, hist_df):
     os.replace(tmp, path)
     print(f"  저장 완료: {len(df)}행 × {len(df.columns)}컬럼"
           + (f" | 신규 컬럼 {new_cols}" if new_cols else ""))
+    neg = int((pd.to_numeric(df.get("days_to_earn"), errors="coerce") < 0).sum()) \
+        if "days_to_earn" in df.columns else "-"
+    ivr = int(df["iv_rank"].notna().sum()) if "iv_rank" in df.columns else "-"
+    return (f"{path}: {len(df)}행 × {len(df.columns)}컬럼 | "
+            f"dte_st {'O' if 'dte_st' in df.columns and df['dte_st'].notna().any() else 'X'} | "
+            f"days_to_earn 음수 {neg}건 | iv_rank {ivr}행")
 
 
 def main():
@@ -235,9 +251,17 @@ def main():
     hist = _combined_history(files)
     if hist is not None:
         print(f"iv_rank 이력: {hist['date'].nunique()}일 / {hist['symbol'].nunique()}종목 (전 파일 합산)")
+    summary = []
     for f in files:
-        process_one(f, do_earn, hist)
-    print("\n완료.")
+        try:
+            summary.append(process_one(f, do_earn, hist))
+        except Exception as e:
+            summary.append(f"{f}: ❌ 실패 — {e}")
+    print("\n" + "=" * 60)
+    print("처리 요약")
+    for line in summary:
+        print("  " + str(line))
+    print("=" * 60)
 
 
 if __name__ == "__main__":
