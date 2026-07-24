@@ -36,7 +36,9 @@ jobs:
       - name: 라이브러리 설치
         run: |
           pip install --upgrade pip
-          pip install --upgrade pandas yfinance
+          # lxml/html5lib: yfinance가 실적 캘린더를 파싱할 때 필요.
+          # 빠지면 get_earnings_date가 전 종목 실패한다.
+          pip install --upgrade pandas yfinance lxml html5lib requests
 
       - name: 보정 전 상태 기록
         run: |

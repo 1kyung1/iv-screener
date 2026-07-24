@@ -24,7 +24,9 @@ jobs:
       - name: 라이브러리 설치
         run: |
           pip install --upgrade pip
-          pip install --upgrade pandas requests alpaca-py html5lib yfinance exchange_calendars
+          # ✅ [v3.2] lxml 추가 — 없으면 yfinance 실적 캘린더 파싱이 실패해
+          #    days_to_earn이 조용히 부정확해진다.
+          pip install --upgrade pandas requests alpaca-py html5lib lxml yfinance exchange_calendars
       - name: Python 실행
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -38,21 +40,32 @@ jobs:
           git config user.email "actions@github.com"
           cp iv_data_*.csv /tmp/       2>/dev/null || true
           cp market_data_*.csv /tmp/   2>/dev/null || true
-          cp failed_symbols.txt /tmp/  2>/dev/null || true
+          cp failed_details.csv /tmp/  2>/dev/null || true
           cp info_cache.json /tmp/     2>/dev/null || true
           cp earnings_cache.json /tmp/ 2>/dev/null || true
           git fetch origin main
           git reset --hard origin/main
           cp /tmp/iv_data_*.csv .       2>/dev/null || true
           cp /tmp/market_data_*.csv .   2>/dev/null || true
-          cp /tmp/failed_symbols.txt .  2>/dev/null || true
+          cp /tmp/failed_details.csv .  2>/dev/null || true
           cp /tmp/info_cache.json .     2>/dev/null || true
           cp /tmp/earnings_cache.json . 2>/dev/null || true
           git add iv_data_*.csv       || true
           git add market_data_*.csv   || true
-          git add failed_symbols.txt  || true
-          git add iv_data.csv         || true
+          git add failed_details.csv  || true
           git add info_cache.json     || true
           git add earnings_cache.json || true
           git diff --staged --quiet || git commit -m "IV data $(date +'%Y-%m-%d')"
           git push origin main
+
+      # ✅ [v3.2 추가] 데이터 연속성 검증
+      #    - 푸시 '뒤'에 두는 이유: 검증이 실패해도 수집 결과는 이미 저장됨
+      #    - if: always() 인 이유: 수집이 죽어도 "오늘 데이터 없음" 알림은 와야 함
+      #    - continue-on-error: 검증 오류가 워크플로 실패로 잡히지 않게
+      - name: 데이터 연속성 검증
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python validate_iv_data.py
