@@ -250,6 +250,59 @@ def _r6_calcver(df, d_cur, window=5):
 # ==========================================================
 # 공개 API
 # ==========================================================
+GEX_MATCHED_MIN = 100       # 지수 GEX matched 계약 수 하한
+GEX_MATCHED_DROP = 0.5      # 전일 대비 50% 이상 급감
+GEX_COVER_MIN = 0.90        # yf OI 만기 완주율 하한
+
+
+def check_market_gex(target_date=None):
+    """market_data의 지수 GEX 무결성 점검.
+    IV 검증(500종목)은 market_data를 못 보므로 별도로 확인한다.
+    2026-07-23에 spy_gex_matched=27(다른 날의 4%)로 GEX가 오염됐는데,
+    IV 검증만으로는 잡히지 않았다."""
+    import glob as _glob
+    paths = sorted(_glob.glob("market_data_*_H*.csv"))
+    if not paths:
+        return []
+    try:
+        m = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+    except Exception:
+        return []
+    if "date" not in m.columns:
+        return []
+    m = m.sort_values("date").reset_index(drop=True)
+    dates = list(m["date"])
+    d_cur = str(target_date) if target_date else dates[-1]
+    if d_cur not in dates:
+        return []
+    i = dates.index(d_cur)
+    cur = m[m["date"] == d_cur].iloc[0]
+    prev = m[m["date"] == dates[i - 1]].iloc[0] if i > 0 else None
+
+    out = []
+    for idx in ("spy", "qqq", "iwm"):
+        mc, cov = f"{idx}_gex_matched", f"{idx}_gex_oi_cover"
+        if mc in m.columns and pd.notna(cur.get(mc)):
+            v = cur[mc]
+            if v < GEX_MATCHED_MIN:
+                out.append(
+                    f"⚠️ <b>{idx.upper()} GEX 계약수 부족</b>\n"
+                    f"   matched={int(v)} (< {GEX_MATCHED_MIN}) → 이 날 GEX는 신뢰 불가, 분석서 제외"
+                )
+            elif prev is not None and pd.notna(prev.get(mc)) and prev[mc] > 0:
+                if v / prev[mc] <= GEX_MATCHED_DROP:
+                    out.append(
+                        f"⚠️ <b>{idx.upper()} GEX 계약수 급감</b>\n"
+                        f"   {int(prev[mc])} → {int(v)} → 부분수집 의심"
+                    )
+        if cov in m.columns and pd.notna(cur.get(cov)) and cur[cov] < GEX_COVER_MIN:
+            out.append(
+                f"⚠️ <b>{idx.upper()} OI 완주율 낮음</b>\n"
+                f"   {cur[cov]*100:.0f}% (< {GEX_COVER_MIN*100:.0f}%) → 만기 일부 누락"
+            )
+    return out
+
+
 def check_history_drift(base_name="iv_data", target_date=None, csv_path=None):
     """target_date(기본: 최신일)를 직전 수집일과 비교해 경고 목록을 반환."""
     df = _load(csv_path, base_name)
@@ -275,6 +328,7 @@ def check_history_drift(base_name="iv_data", target_date=None, csv_path=None):
         alerts += _r5_expiry(cur, prev)
     alerts += _r4_range(cur, prev)
     alerts += _r6_calcver(df, d_cur)
+    alerts += check_market_gex(d_cur)      # ✅ [v3.2] 지수 GEX 무결성
     return alerts
 
 
