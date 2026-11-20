@@ -1,2 +1,2 @@
 ﻿symbol,reason,detail
-VYLR,ALPACA_EMPTY,옵션체인 응답이 비어있음
+FOXA,ALPACA_NO_IV,filtered 62개 옵션 모두 IV=None
